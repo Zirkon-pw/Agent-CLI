@@ -1,0 +1,132 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: go test -count=1 -race ./...
+
+      - name: Set version vars
+        id: vars
+        run: |
+          echo "VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "DATE=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Build all platforms
+        env:
+          VERSION: ${{ steps.vars.outputs.VERSION }}
+          COMMIT: ${{ steps.vars.outputs.COMMIT }}
+          DATE: ${{ steps.vars.outputs.DATE }}
+        run: |
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${DATE}"
+          mkdir -p dist
+
+          platforms=(
+            "linux/amd64"
+            "linux/arm64"
+            "darwin/amd64"
+            "darwin/arm64"
+            "windows/amd64"
+            "windows/arm64"
+          )
+
+          for platform in "${platforms[@]}"; do
+            IFS='/' read -r GOOS GOARCH <<< "$platform"
+            output="agentctl-${GOOS}-${GOARCH}"
+            if [ "$GOOS" = "windows" ]; then
+              output="${output}.exe"
+            fi
+            echo "Building ${GOOS}/${GOARCH}..."
+            GOOS=$GOOS GOARCH=$GOARCH go build -ldflags "$LDFLAGS" -o "dist/${output}" ./cmd/agentctl
+          done
+
+      - name: Create checksums
+        working-directory: dist
+        run: sha256sum * > checksums.txt
+
+      - name: Create archives
+        working-directory: dist
+        run: |
+          for f in agentctl-*; do
+            name="${f%.*}"
+            if [[ "$f" == *.exe ]]; then
+              name="${f%.exe}"
+              zip "${name}.zip" "$f"
+            else
+              tar czf "${name}.tar.gz" "$f"
+            fi
+          done
+          # Regenerate checksums with archives
+          sha256sum *.tar.gz *.zip 2>/dev/null > checksums.txt
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          prev_tag=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$prev_tag" ]; then
+            log=$(git log --oneline "${prev_tag}..HEAD" --no-merges)
+          else
+            log=$(git log --oneline --no-merges -20)
+          fi
+          {
+            echo "CHANGELOG<<EOF"
+            echo "$log"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: |
+            ## agentctl ${{ steps.vars.outputs.VERSION }}
+
+            ### Changes
+            ${{ steps.changelog.outputs.CHANGELOG }}
+
+            ### Installation
+
+            **macOS (Apple Silicon)**
+            ```bash
+            curl -Lo agentctl https://github.com/${{ github.repository }}/releases/download/${{ steps.vars.outputs.VERSION }}/agentctl-darwin-arm64
+            chmod +x agentctl && sudo mv agentctl /usr/local/bin/
+            ```
+
+            **macOS (Intel)**
+            ```bash
+            curl -Lo agentctl https://github.com/${{ github.repository }}/releases/download/${{ steps.vars.outputs.VERSION }}/agentctl-darwin-amd64
+            chmod +x agentctl && sudo mv agentctl /usr/local/bin/
+            ```
+
+            **Linux (x86_64)**
+            ```bash
+            curl -Lo agentctl https://github.com/${{ github.repository }}/releases/download/${{ steps.vars.outputs.VERSION }}/agentctl-linux-amd64
+            chmod +x agentctl && sudo mv agentctl /usr/local/bin/
+            ```
+
+            **Windows** — скачайте `agentctl-windows-amd64.zip` из assets ниже.
+
+            ### Checksums
+            See `checksums.txt` in assets.
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+          generate_release_notes: true
