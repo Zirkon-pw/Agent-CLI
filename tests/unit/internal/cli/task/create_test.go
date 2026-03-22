@@ -37,29 +37,14 @@ func TestCreateCmd_Flags(t *testing.T) {
 	}
 }
 
-func TestCreateCmd_RequiresTitle(t *testing.T) {
+func TestCreateCmd_AllowsEmptyDraft(t *testing.T) {
 	handler := setupCreateCmd(t)
 	cmd := NewCreateCmd(handler)
-	cmd.SetArgs([]string{"--goal", "test"})
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
 
-	err := cmd.Execute()
-	if err == nil {
-		t.Fatal("expected error when --title missing")
-	}
-}
-
-func TestCreateCmd_RequiresGoal(t *testing.T) {
-	handler := setupCreateCmd(t)
-	cmd := NewCreateCmd(handler)
-	cmd.SetArgs([]string{"--title", "test"})
-	cmd.SetOut(&bytes.Buffer{})
-	cmd.SetErr(&bytes.Buffer{})
-
-	err := cmd.Execute()
-	if err == nil {
-		t.Fatal("expected error when --goal missing")
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
 	}
 }
 

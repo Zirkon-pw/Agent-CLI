@@ -48,22 +48,25 @@ make release
 # 1. Инициализация проекта
 agentctl init
 
-# 2. Создание задачи
-agentctl task create \
+# 2. Создание draft-задачи
+agentctl task create
+
+# 3. Конфигурация задачи
+agentctl task update TASK-001 \
   --title "Рефакторинг auth модуля" \
   --goal "Вынести логику авторизации в отдельный сервисный слой" \
   --agent claude \
-  --template clarify_if_needed
+  --add-template clarify_if_needed
 
-# 3. Запуск
+# 4. Запуск
 agentctl task run TASK-001
 
-# 4. Проверка результатов
+# 5. Проверка результатов
 agentctl task inspect TASK-001
 agentctl result show TASK-001
 agentctl result diff TASK-001
 
-# 5. Принятие или отклонение
+# 6. Принятие или отклонение
 agentctl task accept TASK-001
 agentctl task reject TASK-001 --reason "не покрыто тестами"
 ```
@@ -74,8 +77,8 @@ agentctl task reject TASK-001 --reason "не покрыто тестами"
 
 | Команда | Описание |
 |---------|----------|
-| `task create` | Создать задачу |
-| `task update` | Обновить задачу в статусе draft |
+| `task create` | Создать draft-задачу, в том числе пустую |
+| `task update` | Донастроить задачу в статусе draft |
 | `task run` | Запустить выполнение |
 | `task resume` | Возобновить после паузы/стопа/уточнения |
 | `task rerun` | Перезапустить задачу |
@@ -144,6 +147,36 @@ validation:
 
 - **simple** — команды выполняются, exit 0 = pass, иначе fail
 - **full** — при ошибке результат отправляется агенту на исправление, до `max_retries` попыток
+
+## Создание и настройка задач
+
+`task create` больше не требует обязательных `--title` и `--goal`. Команда может создать пустую draft-задачу, которую затем можно постепенно заполнить через `task update`.
+
+Примеры:
+
+```bash
+# Пустая draft-задача
+agentctl task create
+
+# Частичное создание
+agentctl task create --title "Подготовить auth refactor"
+
+# Донастройка перед запуском
+agentctl task update TASK-001 \
+  --goal "Вынести логику авторизации в отдельный сервисный слой" \
+  --agent claude \
+  --add-template clarify_if_needed \
+  --add-allowed-path internal/service/auth \
+  --add-must-read README.md
+
+# Расширенные правки через dot-path
+agentctl task update TASK-001 \
+  --set validation.mode=full \
+  --add validation.commands="go test ./..." \
+  --set runtime.max_execution_minutes=30
+```
+
+Перед `task run` и `task resume` у задачи обязательно должны быть заполнены `title` и `goal`. Если `agent` или built-in шаблоны не заданы, они будут подставлены из project config во время запуска и сохранены обратно в task YAML.
 
 ## Makefile
 

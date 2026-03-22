@@ -34,7 +34,8 @@ var topics = map[string]string{
 ===============
 Tasks are the central unit of work in agentctl.
 
-Create:   agentctl task create --title "..." --goal "..."
+Create:   agentctl task create
+Configure: agentctl task update TASK-001 --title "..." --goal "..."
 Run:      agentctl task run TASK-001
 List:     agentctl task list
 Inspect:  agentctl task inspect TASK-001
@@ -90,16 +91,17 @@ Configure in task YAML:
 	"workflow": `Typical Workflow
 ================
 1. agentctl init                    — Initialize project
-2. agentctl task create ...         — Create a task
-3. agentctl task run TASK-001       — Execute with agent
-4. agentctl task inspect TASK-001   — Check results
-5. agentctl task accept TASK-001    — Approve results
+2. agentctl task create             — Create a draft task
+3. agentctl task update TASK-001 ... — Fill in title, goal, scope, templates
+4. agentctl task run TASK-001       — Execute with agent
+5. agentctl task inspect TASK-001   — Check results
+6. agentctl task accept TASK-001    — Approve results
 
 With clarification:
-3. agentctl task run TASK-001
-4. (agent requests clarification)
-5. agentctl clarification show TASK-001
-6. (edit clarification YAML)
-7. agentctl clarification attach TASK-001 <path>
-8. agentctl task resume TASK-001`,
+4. agentctl task run TASK-001
+5. (agent requests clarification)
+6. agentctl clarification show TASK-001
+7. (edit clarification YAML)
+8. agentctl clarification attach TASK-001 <path>
+9. agentctl task resume TASK-001`,
 }

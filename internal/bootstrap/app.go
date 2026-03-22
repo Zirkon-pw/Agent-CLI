@@ -23,28 +23,28 @@ import (
 // App holds all wired services and command/query handlers.
 type App struct {
 	// Stores
-	TaskStore      *fsstore.TaskStore
-	RunStore       *fsstore.RunStore
-	ClarStore      *fsstore.ClarificationStore
-	TemplateStore  *fsstore.TemplateStore
+	TaskStore     *fsstore.TaskStore
+	RunStore      *fsstore.RunStore
+	ClarStore     *fsstore.ClarificationStore
+	TemplateStore *fsstore.TemplateStore
 
 	// Services
-	Orchestrator   *taskrunner.Orchestrator
-	ClarMgr        *clarificationflow.Manager
-	RuntimeMgr     *runtimecontrol.Manager
+	Orchestrator *taskrunner.Orchestrator
+	ClarMgr      *clarificationflow.Manager
+	RuntimeMgr   *runtimecontrol.Manager
 
 	// Commands
-	CreateTask     *command.CreateTask
-	UpdateTask     *command.UpdateTask
-	RunTask        *command.RunTask
+	CreateTask *command.CreateTask
+	UpdateTask *command.UpdateTask
+	RunTask    *command.RunTask
 
 	// Queries
-	ListTasks      *query.ListTasks
-	InspectTask    *query.InspectTask
+	ListTasks   *query.ListTasks
+	InspectTask *query.InspectTask
 
 	// Config
-	AgentctlDir    string
-	ProjectRoot    string
+	AgentctlDir string
+	ProjectRoot string
 }
 
 // NewApp creates a fully wired application from the workspace.
@@ -82,6 +82,7 @@ func NewApp() (*App, error) {
 	orchestrator := taskrunner.NewOrchestrator(
 		taskStore, runStore, registry, heartbeatMgr, eventSink,
 		ctxBuilder, promptBuilder, agentExec, validator,
+		ws.Config,
 		agentctlDir, projectRoot,
 	)
 

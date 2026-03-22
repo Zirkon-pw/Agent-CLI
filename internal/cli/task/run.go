@@ -1,7 +1,6 @@
 package task
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/docup/agentctl/internal/app/command"
@@ -17,7 +16,7 @@ func NewRunCmd(handler *command.RunTask) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			taskID := args[0]
 			fmt.Printf("Running task %s...\n", taskID)
-			if err := handler.Execute(context.Background(), taskID); err != nil {
+			if err := handler.Execute(cmd.Context(), taskID); err != nil {
 				return err
 			}
 			fmt.Printf("Task %s execution completed.\n", taskID)

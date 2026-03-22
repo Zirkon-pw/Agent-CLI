@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/docup/agentctl/internal/config/loader"
 	"github.com/docup/agentctl/internal/core/run"
 	rt "github.com/docup/agentctl/internal/core/runtime"
 	"github.com/docup/agentctl/internal/core/task"
@@ -32,6 +33,7 @@ type Orchestrator struct {
 	promptBuilder  *prompting.Builder
 	executor       *executor.AgentExecutor
 	validator      *validationrunner.Runner
+	config         *loader.ProjectConfig
 	agentctlDir    string
 	projectRoot    string
 }
@@ -47,6 +49,7 @@ func NewOrchestrator(
 	promptBuilder *prompting.Builder,
 	exec *executor.AgentExecutor,
 	validator *validationrunner.Runner,
+	config *loader.ProjectConfig,
 	agentctlDir string,
 	projectRoot string,
 ) *Orchestrator {
@@ -60,6 +63,7 @@ func NewOrchestrator(
 		promptBuilder:  promptBuilder,
 		executor:       exec,
 		validator:      validator,
+		config:         config,
 		agentctlDir:    agentctlDir,
 		projectRoot:    projectRoot,
 	}
@@ -70,6 +74,16 @@ func (o *Orchestrator) Run(ctx context.Context, taskID string) error {
 	t, err := o.taskStore.Load(taskID)
 	if err != nil {
 		return err
+	}
+
+	changed, err := o.validateAndNormalizeForRun(t)
+	if err != nil {
+		return err
+	}
+	if changed {
+		if err := o.taskStore.Save(t); err != nil {
+			return fmt.Errorf("saving normalized task: %w", err)
+		}
 	}
 
 	// Transition to queued
@@ -115,14 +129,14 @@ func (o *Orchestrator) Run(ctx context.Context, taskID string) error {
 
 	// Create run entity
 	r := &run.Run{
-		ID:              runID,
-		TaskID:          taskID,
-		Status:          run.RunStatusPending,
-		Agent:           t.Agent,
-		PromptFile:      filepath.Join(runDir, "prompt.md"),
+		ID:               runID,
+		TaskID:           taskID,
+		Status:           run.RunStatusPending,
+		Agent:            t.Agent,
+		PromptFile:       filepath.Join(runDir, "prompt.md"),
 		TemplateLockFile: filepath.Join(runDir, "prompt_template_lock.yml"),
-		Clarifications:  t.Clarifications.Attached,
-		CreatedAt:       time.Now(),
+		Clarifications:   t.Clarifications.Attached,
+		CreatedAt:        time.Now(),
 	}
 
 	// Transition to running
@@ -236,6 +250,28 @@ func (o *Orchestrator) heartbeatLoop(ctx context.Context, taskID, runID string, 
 			o.heartbeatMgr.Write(taskID, runID)
 		}
 	}
+}
+
+func (o *Orchestrator) validateAndNormalizeForRun(t *task.Task) (bool, error) {
+	changed := false
+
+	if t.Agent == "" {
+		t.Agent = o.config.Execution.DefaultAgent
+		changed = true
+	}
+	if len(t.PromptTemplates.Builtin) == 0 {
+		t.PromptTemplates.Builtin = []string{o.config.Prompting.DefaultTemplate}
+		changed = true
+	}
+
+	if t.Title == "" {
+		return changed, fmt.Errorf("task %s is missing required field: title", t.ID)
+	}
+	if t.Goal == "" {
+		return changed, fmt.Errorf("task %s is missing required field: goal", t.ID)
+	}
+
+	return changed, nil
 }
 
 // Stop sends a graceful stop signal to a running task.

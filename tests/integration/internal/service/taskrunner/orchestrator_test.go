@@ -43,10 +43,13 @@ func setupOrchestrator(t *testing.T) (*Orchestrator, *fsstore.TaskStore, string)
 		},
 	})
 	validator := validationrunner.NewRunner(root, agentExec, runStore, agentctlDir)
+	cfg := loader.DefaultProjectConfig()
+	cfg.Execution.DefaultAgent = "echo"
 
 	orch := NewOrchestrator(
 		taskStore, runStore, registry, heartbeatMgr, eventSink,
 		ctxBuilder, promptBuilder, agentExec, validator,
+		cfg,
 		agentctlDir, root,
 	)
 	return orch, taskStore, agentctlDir
@@ -151,6 +154,58 @@ func TestOrchestrator_Run_ValidationFails(t *testing.T) {
 	tk, _ := store.Load("TASK-001")
 	if tk.Status != task.StatusFailed {
 		t.Errorf("expected failed, got %s", tk.Status)
+	}
+}
+
+func TestOrchestrator_Run_NormalizesAgentAndTemplate(t *testing.T) {
+	orch, store, _ := setupOrchestrator(t)
+
+	now := time.Now()
+	store.Save(&task.Task{
+		ID:              "TASK-001",
+		Title:           "Needs defaults",
+		Goal:            "Run with normalized defaults",
+		Status:          task.StatusDraft,
+		PromptTemplates: task.PromptTemplates{},
+		Clarifications:  task.Clarifications{Attached: []string{}},
+		Runtime:         task.DefaultRuntimeConfig(),
+		Validation:      task.ValidationConfig{Mode: task.ValidationModeSimple},
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+
+	if err := orch.Run(context.Background(), "TASK-001"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	tk, _ := store.Load("TASK-001")
+	if tk.Agent != "echo" {
+		t.Errorf("expected normalized agent echo, got %s", tk.Agent)
+	}
+	if len(tk.PromptTemplates.Builtin) != 1 || tk.PromptTemplates.Builtin[0] != "strict_executor" {
+		t.Errorf("expected normalized template strict_executor, got %v", tk.PromptTemplates.Builtin)
+	}
+}
+
+func TestOrchestrator_Run_RequiresTitleAndGoal(t *testing.T) {
+	orch, store, _ := setupOrchestrator(t)
+
+	now := time.Now()
+	store.Save(&task.Task{
+		ID:              "TASK-001",
+		Goal:            "Goal only",
+		Status:          task.StatusDraft,
+		PromptTemplates: task.PromptTemplates{},
+		Clarifications:  task.Clarifications{Attached: []string{}},
+		Runtime:         task.DefaultRuntimeConfig(),
+		Validation:      task.ValidationConfig{Mode: task.ValidationModeSimple},
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+
+	err := orch.Run(context.Background(), "TASK-001")
+	if err == nil {
+		t.Fatal("expected missing title error")
 	}
 }
 

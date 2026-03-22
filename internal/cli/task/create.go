@@ -23,15 +23,8 @@ func NewCreateCmd(handler *command.CreateTask) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "create",
-		Short: "Create a new task",
+		Short: "Create a new draft task",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if title == "" {
-				return fmt.Errorf("--title is required")
-			}
-			if goal == "" {
-				return fmt.Errorf("--goal is required")
-			}
-
 			req := dto.CreateTaskRequest{
 				Title:     title,
 				Goal:      goal,
@@ -42,7 +35,15 @@ func NewCreateCmd(handler *command.CreateTask) *cobra.Command {
 					ForbiddenPaths: forbidden,
 					MustRead:       mustRead,
 				},
-				Guidelines: guidelines,
+				Guidelines:        guidelines,
+				TitleSet:          cmd.Flags().Changed("title"),
+				GoalSet:           cmd.Flags().Changed("goal"),
+				AgentSet:          cmd.Flags().Changed("agent"),
+				TemplatesSet:      cmd.Flags().Changed("template"),
+				GuidelinesSet:     cmd.Flags().Changed("guideline"),
+				AllowedPathsSet:   cmd.Flags().Changed("allowed-path"),
+				ForbiddenPathsSet: cmd.Flags().Changed("forbidden-path"),
+				MustReadSet:       cmd.Flags().Changed("must-read"),
 			}
 
 			t, err := handler.Execute(req)
@@ -50,7 +51,10 @@ func NewCreateCmd(handler *command.CreateTask) *cobra.Command {
 				return err
 			}
 
-			fmt.Printf("Created task %s: %s\n", t.ID, t.Title)
+			fmt.Printf("Created task %s\n", t.ID)
+			if t.Title != "" {
+				fmt.Printf("  Title:     %s\n", t.Title)
+			}
 			fmt.Printf("  Agent:     %s\n", t.Agent)
 			fmt.Printf("  Status:    %s\n", t.Status)
 			fmt.Printf("  Templates: %v\n", t.PromptTemplates.Builtin)
@@ -58,9 +62,9 @@ func NewCreateCmd(handler *command.CreateTask) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&title, "title", "", "Task title (required)")
-	cmd.Flags().StringVar(&goal, "goal", "", "Engineering goal (required)")
-	cmd.Flags().StringVar(&agent, "agent", "", "Agent to use (default from config)")
+	cmd.Flags().StringVar(&title, "title", "", "Task title")
+	cmd.Flags().StringVar(&goal, "goal", "", "Engineering goal")
+	cmd.Flags().StringVar(&agent, "agent", "", "Agent to use (default is resolved from config at run time)")
 	cmd.Flags().StringSliceVar(&templates, "template", nil, "Prompt templates to apply")
 	cmd.Flags().StringSliceVar(&guidelines, "guideline", nil, "Guidelines to include")
 	cmd.Flags().StringSliceVar(&allowed, "allowed-path", nil, "Allowed file paths")

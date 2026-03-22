@@ -2,12 +2,20 @@ package dto
 
 // CreateTaskRequest holds parameters for task creation.
 type CreateTaskRequest struct {
-	Title     string
-	Goal      string
-	Agent     string
-	Templates []string
-	Scope     ScopeDTO
-	Guidelines []string
+	Title             string
+	Goal              string
+	Agent             string
+	Templates         []string
+	Scope             ScopeDTO
+	Guidelines        []string
+	TitleSet          bool
+	GoalSet           bool
+	AgentSet          bool
+	TemplatesSet      bool
+	GuidelinesSet     bool
+	AllowedPathsSet   bool
+	ForbiddenPathsSet bool
+	MustReadSet       bool
 }
 
 type ScopeDTO struct {
@@ -18,10 +26,37 @@ type ScopeDTO struct {
 
 // UpdateTaskRequest holds parameters for task update.
 type UpdateTaskRequest struct {
-	TaskID         string
-	AddTemplates   []string
-	RemoveTemplates []string
-	AddGuidelines  []string
+	TaskID               string
+	Title                *string
+	Goal                 *string
+	Agent                *string
+	AddTemplates         []string
+	RemoveTemplates      []string
+	AddGuidelines        []string
+	RemoveGuidelines     []string
+	AddAllowedPaths      []string
+	RemoveAllowedPaths   []string
+	AddForbiddenPaths    []string
+	RemoveForbiddenPaths []string
+	AddMustRead          []string
+	RemoveMustRead       []string
+	Mutations            []TaskMutation
+}
+
+// MutationKind is the operation to apply to a task path.
+type MutationKind string
+
+const (
+	MutationSet    MutationKind = "set"
+	MutationAdd    MutationKind = "add"
+	MutationRemove MutationKind = "remove"
+)
+
+// TaskMutation describes a generic change against a dot-notated task path.
+type TaskMutation struct {
+	Kind  MutationKind
+	Path  string
+	Value interface{}
 }
 
 // RunTaskRequest holds parameters for running a task.

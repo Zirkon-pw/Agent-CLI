@@ -27,33 +27,8 @@ func (u *UpdateTask) Execute(req dto.UpdateTaskRequest) (*task.Task, error) {
 		return nil, fmt.Errorf("can only update tasks in draft status, current: %s", t.Status)
 	}
 
-	for _, tmpl := range req.AddTemplates {
-		if !t.HasTemplate(tmpl) {
-			t.PromptTemplates.Builtin = append(t.PromptTemplates.Builtin, tmpl)
-		}
-	}
-
-	for _, tmpl := range req.RemoveTemplates {
-		filtered := make([]string, 0)
-		for _, existing := range t.PromptTemplates.Builtin {
-			if existing != tmpl {
-				filtered = append(filtered, existing)
-			}
-		}
-		t.PromptTemplates.Builtin = filtered
-	}
-
-	for _, g := range req.AddGuidelines {
-		found := false
-		for _, existing := range t.Guidelines {
-			if existing == g {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Guidelines = append(t.Guidelines, g)
-		}
+	if err := applyTaskUpdate(t, req); err != nil {
+		return nil, err
 	}
 
 	if err := u.taskStore.Save(t); err != nil {

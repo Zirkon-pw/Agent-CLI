@@ -28,33 +28,16 @@ func (c *CreateTask) Execute(req dto.CreateTaskRequest) (*task.Task, error) {
 		return nil, fmt.Errorf("generating task ID: %w", err)
 	}
 
-	agent := req.Agent
-	if agent == "" {
-		agent = c.config.Execution.DefaultAgent
-	}
-
-	templates := req.Templates
-	if len(templates) == 0 {
-		templates = []string{c.config.Prompting.DefaultTemplate}
-	}
-
 	now := time.Now()
 	t := &task.Task{
 		ID:     id,
-		Title:  req.Title,
-		Goal:   req.Goal,
 		Status: task.StatusDraft,
-		Agent:  agent,
 		PromptTemplates: task.PromptTemplates{
-			Builtin: templates,
+			Builtin: []string{},
 			Custom:  []string{},
 		},
-		Scope: task.Scope{
-			AllowedPaths:   req.Scope.AllowedPaths,
-			ForbiddenPaths: req.Scope.ForbiddenPaths,
-			MustRead:       req.Scope.MustRead,
-		},
-		Guidelines: req.Guidelines,
+		Scope:      task.Scope{},
+		Guidelines: []string{},
 		Context:    task.ContextConfig{},
 		Constraints: task.Constraints{
 			NoBreakingChanges: false,
@@ -66,7 +49,7 @@ func (c *CreateTask) Execute(req dto.CreateTaskRequest) (*task.Task, error) {
 		Clarifications: task.Clarifications{
 			Attached: []string{},
 		},
-		Runtime:    task.DefaultRuntimeConfig(),
+		Runtime: task.DefaultRuntimeConfig(),
 		Validation: task.ValidationConfig{
 			Mode:       task.ValidationMode(c.config.Validation.DefaultMode),
 			MaxRetries: c.config.Validation.DefaultMaxRetries,
@@ -74,6 +57,31 @@ func (c *CreateTask) Execute(req dto.CreateTaskRequest) (*task.Task, error) {
 		},
 		CreatedAt: now,
 		UpdatedAt: now,
+	}
+
+	if req.TitleSet || req.Title != "" {
+		t.Title = req.Title
+	}
+	if req.GoalSet || req.Goal != "" {
+		t.Goal = req.Goal
+	}
+	if req.AgentSet || req.Agent != "" {
+		t.Agent = req.Agent
+	}
+	if req.TemplatesSet || len(req.Templates) > 0 {
+		t.PromptTemplates.Builtin = append([]string(nil), req.Templates...)
+	}
+	if req.GuidelinesSet || len(req.Guidelines) > 0 {
+		t.Guidelines = append([]string(nil), req.Guidelines...)
+	}
+	if req.AllowedPathsSet || len(req.Scope.AllowedPaths) > 0 {
+		t.Scope.AllowedPaths = append([]string(nil), req.Scope.AllowedPaths...)
+	}
+	if req.ForbiddenPathsSet || len(req.Scope.ForbiddenPaths) > 0 {
+		t.Scope.ForbiddenPaths = append([]string(nil), req.Scope.ForbiddenPaths...)
+	}
+	if req.MustReadSet || len(req.Scope.MustRead) > 0 {
+		t.Scope.MustRead = append([]string(nil), req.Scope.MustRead...)
 	}
 
 	if err := c.taskStore.Save(t); err != nil {

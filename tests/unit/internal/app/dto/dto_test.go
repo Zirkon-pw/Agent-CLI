@@ -8,11 +8,15 @@ import (
 
 func TestCreateTaskRequest_Fields(t *testing.T) {
 	req := CreateTaskRequest{
-		Title:      "Test",
-		Goal:       "Goal",
-		Agent:      "claude",
-		Templates:  []string{"strict_executor"},
-		Guidelines: []string{"backend"},
+		Title:         "Test",
+		Goal:          "Goal",
+		Agent:         "claude",
+		Templates:     []string{"strict_executor"},
+		Guidelines:    []string{"backend"},
+		TitleSet:      true,
+		GoalSet:       true,
+		TemplatesSet:  true,
+		GuidelinesSet: true,
 		Scope: ScopeDTO{
 			AllowedPaths:   []string{"src/"},
 			ForbiddenPaths: []string{"vendor/"},
@@ -28,14 +32,25 @@ func TestCreateTaskRequest_Fields(t *testing.T) {
 }
 
 func TestUpdateTaskRequest_Fields(t *testing.T) {
+	title := "Updated"
 	req := UpdateTaskRequest{
 		TaskID:          "TASK-001",
 		AddTemplates:    []string{"a"},
 		RemoveTemplates: []string{"b"},
 		AddGuidelines:   []string{"c"},
+		Title:           &title,
+		Mutations: []TaskMutation{
+			{Kind: MutationSet, Path: "validation.mode", Value: "full"},
+		},
 	}
 	if req.TaskID != "TASK-001" {
 		t.Error("task ID not set")
+	}
+	if req.Title == nil || *req.Title != "Updated" {
+		t.Error("title not set")
+	}
+	if len(req.Mutations) != 1 || req.Mutations[0].Kind != MutationSet {
+		t.Error("mutations not set")
 	}
 }
 

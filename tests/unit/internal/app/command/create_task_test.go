@@ -38,11 +38,11 @@ func TestCreateTask_Basic(t *testing.T) {
 	if tk.Status != task.StatusDraft {
 		t.Errorf("expected draft, got %s", tk.Status)
 	}
-	if tk.Agent != "claude" { // default
-		t.Errorf("expected default agent claude, got %s", tk.Agent)
+	if tk.Agent != "" {
+		t.Errorf("expected empty agent, got %s", tk.Agent)
 	}
-	if len(tk.PromptTemplates.Builtin) != 1 || tk.PromptTemplates.Builtin[0] != "strict_executor" {
-		t.Errorf("expected default template strict_executor, got %v", tk.PromptTemplates.Builtin)
+	if len(tk.PromptTemplates.Builtin) != 0 {
+		t.Errorf("expected no default templates, got %v", tk.PromptTemplates.Builtin)
 	}
 }
 
@@ -115,6 +115,27 @@ func TestCreateTask_Persisted(t *testing.T) {
 	}
 	if loaded.Title != "Persisted" {
 		t.Errorf("wrong title: %s", loaded.Title)
+	}
+}
+
+func TestCreateTask_EmptyDraft(t *testing.T) {
+	handler, _ := setupCreateTask(t)
+
+	tk, err := handler.Execute(dto.CreateTaskRequest{})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if tk.Title != "" {
+		t.Errorf("expected empty title, got %q", tk.Title)
+	}
+	if tk.Goal != "" {
+		t.Errorf("expected empty goal, got %q", tk.Goal)
+	}
+	if tk.Agent != "" {
+		t.Errorf("expected empty agent, got %q", tk.Agent)
+	}
+	if len(tk.PromptTemplates.Builtin) != 0 {
+		t.Errorf("expected no builtin templates, got %v", tk.PromptTemplates.Builtin)
 	}
 }
 
