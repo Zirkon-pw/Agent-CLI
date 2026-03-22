@@ -1,18 +1,30 @@
 package query
 
 import (
-	. "github.com/docup/agentctl/internal/app/query"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	. "github.com/docup/agentctl/internal/app/query"
+	rt "github.com/docup/agentctl/internal/core/runtime"
 	"github.com/docup/agentctl/internal/core/task"
+	"github.com/docup/agentctl/internal/infra/fsstore"
 )
 
+func setupInspectStores(t *testing.T) (*fsstore.TaskStore, *fsstore.RunStore) {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), ".agentctl")
+	_ = os.MkdirAll(filepath.Join(dir, "tasks"), 0755)
+	_ = os.MkdirAll(filepath.Join(dir, "runs"), 0755)
+	return fsstore.NewTaskStore(dir), fsstore.NewRunStore(dir)
+}
+
 func TestInspectTask_Found(t *testing.T) {
-	store := setupStore(t)
+	store, runStore := setupInspectStores(t)
 	now := time.Now()
 
-	store.Save(&task.Task{
+	_ = store.Save(&task.Task{
 		ID:     "TASK-001",
 		Title:  "Inspect me",
 		Goal:   "Test goal",
@@ -37,7 +49,30 @@ func TestInspectTask_Found(t *testing.T) {
 		UpdatedAt: now,
 	})
 
-	q := NewInspectTask(store)
+	session := &rt.RunSession{
+		ID:             "RUN-001",
+		TaskID:         "TASK-001",
+		Status:         rt.SessionStatusFailed,
+		CurrentAgentID: "claude",
+		ArtifactManifest: rt.ArtifactManifest{
+			Items: []rt.ArtifactRecord{{Name: "runtime_errors.log"}},
+		},
+		StageHistory: []rt.StageRun{
+			{
+				StageID: "STAGE-002",
+				Type:    rt.StageTypeReview,
+				State:   rt.StageStateFailed,
+				Result:  &rt.StageResult{Outcome: "failed", Message: "review unsupported"},
+			},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := runStore.SaveSession(session); err != nil {
+		t.Fatalf("save session: %v", err)
+	}
+
+	q := NewInspectTask(store, runStore)
 	detail, err := q.Execute("TASK-001")
 	if err != nil {
 		t.Fatalf("inspect: %v", err)
@@ -61,11 +96,17 @@ func TestInspectTask_Found(t *testing.T) {
 	if len(detail.Scope.AllowedPaths) != 1 {
 		t.Error("expected 1 allowed path")
 	}
+	if detail.LatestSession == nil {
+		t.Fatal("expected latest session details")
+	}
+	if detail.LatestSession.LastError != "review unsupported" {
+		t.Fatalf("expected latest session error, got %q", detail.LatestSession.LastError)
+	}
 }
 
 func TestInspectTask_NotFound(t *testing.T) {
-	store := setupStore(t)
-	q := NewInspectTask(store)
+	store, runStore := setupInspectStores(t)
+	q := NewInspectTask(store, runStore)
 	_, err := q.Execute("NONEXISTENT")
 	if err == nil {
 		t.Fatal("expected error")

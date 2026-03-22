@@ -85,7 +85,7 @@ agentctl task reject TASK-001 --reason "не покрыто тестами"
 | `task list` | Список всех задач |
 | `task inspect` | Детальная информация о задаче |
 | `task ps` | Активные запуски |
-| `task logs` | Логи выполнения (`-f` для follow) |
+| `task logs` | Session/stage логи (`--stage`, `--protocol`, `-f`) |
 | `task events` | События жизненного цикла |
 | `task watch` | Live-мониторинг |
 | `task stop` | Мягкая остановка |
@@ -111,7 +111,7 @@ agentctl task reject TASK-001 --reason "не покрыто тестами"
 | Команда | Описание |
 |---------|----------|
 | `guidelines add/list/show` | Управление гайдлайнами проекта |
-| `result show/diff` | Просмотр результатов выполнения |
+| `result show/diff/list` | Просмотр результатов и артефактов выполнения |
 | `topics <topic>` | Справка по темам (`task`, `template`, `clarification`, `validation`, `workflow`) |
 
 ## Структура `.agentctl/`
@@ -139,15 +139,14 @@ agentctl task reject TASK-001 --reason "не покрыто тестами"
 ├── session.json
 ├── protocol.ndjson
 ├── artifacts.json
-├── summary.md
-├── diff.patch
-├── validation.json
-├── review_report.json
 └── stages/
     ├── STAGE-001/
     │   ├── stage_spec.json
     │   ├── prompt.md
-    │   └── adapter.stderr.log
+    │   ├── adapter.stderr.log
+    │   ├── raw.stdout.log
+    │   ├── raw.stderr.log
+    │   └── runtime_errors.log
     └── STAGE-002/
         └── review_prompt.md
 ```
@@ -181,6 +180,65 @@ validation:
    - `stdin` — control commands (`cancel`, `kill`, `ping` и другие protocol-level команды)
    - `stdout` — protocol events (`hello`, `progress`, `artifact`, `clarification_requested`, `review_report`, `stage_completed` и т.д.)
 5. Supervisor пишет сырой поток в `protocol.ndjson`, поддерживает `artifacts.json`, обновляет `session.json` и materialize-ит YAML-файлы уточнений для пользователя.
+
+## `agents.yaml`
+
+Новая схема `agents.yaml` разделяет descriptive metadata и runtime-способ запуска агента.
+
+Пример:
+
+```yaml
+agents:
+  - id: claude
+    role: executor
+    metadata:
+      specialization: [architecture_refactor, deep_analysis]
+      strengths: [large_context_reasoning, architecture_review]
+      speed: medium
+      cost: high
+      context_limit: large
+      modes: [strict, research]
+      tools: [filesystem, git]
+    runtime:
+      kind: protocol_adapter
+      exec:
+        command: claude-wrapper
+        args: []
+      supported_stages: [execute, validate_fix, review, handoff]
+      control:
+        cancel: true
+        kill: true
+        heartbeat: true
+      protocol:
+        version: v1
+      child_cli:
+        command: claude
+        args: [-p]
+
+  - id: qwen
+    role: executor
+    metadata:
+      specialization: [bulk_tests, code_generation]
+      strengths: [fast_generation, code_edits]
+      speed: high
+      cost: low
+      context_limit: medium
+      modes: [strict, fast]
+      tools: [filesystem, terminal]
+    runtime:
+      kind: raw_cli
+      exec:
+        command: qwen
+        args: []
+      supported_stages: [execute, validate_fix]
+      control:
+        cancel: true
+        kill: true
+```
+
+- `protocol_adapter` — полноценный stage-aware wrapper с NDJSON-протоколом.
+- `raw_cli` — logs-first fallback для обычных CLI без machine-readable stdout.
+- Старые поля `command`, `args`, `adapter_command`, `transport` и похожие больше не поддерживаются.
 
 ## Создание и настройка задач
 

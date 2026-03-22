@@ -69,6 +69,23 @@ func NewInspectCmd(handler *query.InspectTask, rtMgr *runtimecontrol.Manager) *c
 				}
 			}
 
+			if detail.LatestSession != nil {
+				fmt.Printf("\nLatest session:\n")
+				fmt.Printf("  ID: %s\n", detail.LatestSession.ID)
+				fmt.Printf("  Status: %s\n", detail.LatestSession.Status)
+				fmt.Printf("  Agent: %s\n", detail.LatestSession.Agent)
+				if detail.LatestSession.LastStageID != "" {
+					fmt.Printf("  Last stage: %s (%s)\n", detail.LatestSession.LastStageID, detail.LatestSession.LastStageType)
+				}
+				if detail.LatestSession.LastOutcome != "" {
+					fmt.Printf("  Last outcome: %s\n", detail.LatestSession.LastOutcome)
+				}
+				if detail.LatestSession.LastError != "" {
+					fmt.Printf("  Last error: %s\n", detail.LatestSession.LastError)
+				}
+				fmt.Printf("  Artifacts: %d\n", detail.LatestSession.ArtifactCount)
+			}
+
 			return nil
 		},
 	}

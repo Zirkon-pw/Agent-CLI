@@ -323,6 +323,7 @@ type RunSession struct {
 	Status                 SessionStatus       `json:"status"`
 	CurrentAgentID         string              `json:"current_agent_id"`
 	CurrentStageID         string              `json:"current_stage_id,omitempty"`
+	BlockedStageType       StageType           `json:"blocked_stage_type,omitempty"`
 	LastEventSeq           int64               `json:"last_event_seq"`
 	LastCommandSeq         int64               `json:"last_command_seq"`
 	PendingControlCommand  *ProtocolCommand    `json:"pending_control_command,omitempty"`

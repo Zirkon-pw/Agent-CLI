@@ -64,7 +64,7 @@ func main() {
 		taskCmd.AddCommand(clitask.NewRejectCmd(app.Orchestrator))
 		taskCmd.AddCommand(clitask.NewRerunCmd(app.Orchestrator))
 		taskCmd.AddCommand(clitask.NewUpdateCmd(app.UpdateTask))
-		taskCmd.AddCommand(clitask.NewLogsCmd(app.RunStore, app.AgentctlDir))
+		taskCmd.AddCommand(clitask.NewLogsCmd(app.RunStore))
 		taskCmd.AddCommand(clitask.NewEventsCmd(app.RuntimeMgr))
 		taskCmd.AddCommand(clitask.NewWatchCmd(app.InspectTask, app.RuntimeMgr))
 		taskCmd.AddCommand(clitask.NewRouteCmd(app.Orchestrator))

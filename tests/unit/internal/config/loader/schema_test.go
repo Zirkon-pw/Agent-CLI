@@ -74,8 +74,11 @@ func TestLoadAgentsConfig(t *testing.T) {
 	if loaded.Agents[0].ID != "claude" {
 		t.Errorf("first agent should be claude, got %s", loaded.Agents[0].ID)
 	}
-	if loaded.Agents[0].Command != "claude" {
-		t.Errorf("claude command should be 'claude', got %s", loaded.Agents[0].Command)
+	if loaded.Agents[0].Runtime.Exec.Command != "claude" {
+		t.Errorf("claude exec command should be 'claude', got %s", loaded.Agents[0].Runtime.Exec.Command)
+	}
+	if loaded.Agents[2].Runtime.Kind != AgentRuntimeKindRawCLI {
+		t.Errorf("qwen should default to raw_cli, got %s", loaded.Agents[2].Runtime.Kind)
 	}
 }
 
@@ -83,6 +86,22 @@ func TestLoadAgentsConfig_NotFound(t *testing.T) {
 	_, err := LoadAgentsConfig("/nonexistent")
 	if err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestLoadAgentsConfig_LegacySchemaFails(t *testing.T) {
+	dir := tmpConfigDir(t)
+	os.WriteFile(filepath.Join(dir, "agents.yaml"), []byte(`
+agents:
+  - id: legacy
+    role: executor
+    command: legacy-cli
+    args: []
+`), 0644)
+
+	_, err := LoadAgentsConfig(dir)
+	if err == nil {
+		t.Fatal("expected legacy schema error")
 	}
 }
 
@@ -129,8 +148,8 @@ func TestDefaultAgentsConfig(t *testing.T) {
 	ids := map[string]bool{}
 	for _, a := range cfg.Agents {
 		ids[a.ID] = true
-		if a.Command == "" {
-			t.Errorf("agent %s has empty command", a.ID)
+		if a.Runtime.Exec.Command == "" {
+			t.Errorf("agent %s has empty runtime.exec.command", a.ID)
 		}
 	}
 	for _, expected := range []string{"claude", "codex", "qwen"} {

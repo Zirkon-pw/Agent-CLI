@@ -49,30 +49,85 @@ func setupOrchestrator(t *testing.T, script string) (*Orchestrator, *fsstore.Tas
 	cfg := loader.DefaultProjectConfig()
 	cfg.Execution.DefaultAgent = "fake"
 
-	adapters := NewAgentAdapterRegistry(&loader.AgentsConfig{
+	drivers := NewAgentRuntimeRegistry(&loader.AgentsConfig{
 		Agents: []loader.AgentDef{
 			{
-				ID:             "fake",
-				Transport:      "ndjson_stdio",
-				AdapterCommand: adapterPath,
-				Capabilities: rt.AdapterCapabilities{
-					ProtocolVersion:       "v1",
-					SupportsCancel:        true,
-					SupportsKill:          true,
-					SupportsHeartbeat:     true,
-					SupportsClarification: true,
-					SupportsReview:        true,
-					SupportsHandoff:       true,
+				ID:   "fake",
+				Role: "executor",
+				Runtime: loader.AgentRuntime{
+					Kind:            loader.AgentRuntimeKindProtocolAdapter,
+					Exec:            loader.AgentExec{Command: adapterPath},
+					SupportedStages: []rt.StageType{rt.StageTypeExecute, rt.StageTypeValidateFix, rt.StageTypeReview, rt.StageTypeHandoff},
+					Control: loader.AgentControl{
+						Cancel:    true,
+						Kill:      true,
+						Heartbeat: true,
+					},
+					Protocol: &loader.AgentProtocol{Version: "v1"},
 				},
 			},
 		},
 	})
 	supervisor := NewTaskSupervisor(
 		taskStore, runStore, clarStore, registry, heartbeatMgr, eventSink,
-		ctxBuilder, promptBuilder, cfg, adapters, root,
+		ctxBuilder, promptBuilder, cfg, drivers, root,
 	)
 	orch := NewOrchestrator(taskStore, runStore, registry, eventSink, cfg, supervisor)
 	return orch, taskStore, runStore, registry, agentctlDir
+}
+
+func setupRawCLIOrchestrator(t *testing.T, script string) (*Orchestrator, *fsstore.TaskStore, *fsstore.RunStore, string) {
+	t.Helper()
+	root := t.TempDir()
+	agentctlDir := filepath.Join(root, ".agentctl")
+	for _, d := range []string{"tasks", "runs", "runtime", "context", "templates/prompts", "guidelines", "clarifications"} {
+		if err := os.MkdirAll(filepath.Join(agentctlDir, d), 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+
+	rawPath := filepath.Join(root, "fake-raw.sh")
+	if err := os.WriteFile(rawPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write raw cli: %v", err)
+	}
+
+	taskStore := fsstore.NewTaskStore(agentctlDir)
+	runStore := fsstore.NewRunStore(agentctlDir)
+	clarStore := fsstore.NewClarificationStore(agentctlDir)
+	registry := infrart.NewRegistry(agentctlDir)
+	heartbeatMgr := infrart.NewHeartbeatManager(agentctlDir)
+	eventSink := events.NewSink(filepath.Join(agentctlDir, "runtime"))
+	ctxBuilder := contextpack.NewBuilder(agentctlDir, root)
+	templateStore := fsstore.NewTemplateStore(agentctlDir)
+	promptBuilder := prompting.NewBuilder(templateStore, agentctlDir)
+
+	cfg := loader.DefaultProjectConfig()
+	cfg.Execution.DefaultAgent = "raw"
+
+	drivers := NewAgentRuntimeRegistry(&loader.AgentsConfig{
+		Agents: []loader.AgentDef{
+			{
+				ID:   "raw",
+				Role: "executor",
+				Runtime: loader.AgentRuntime{
+					Kind:            loader.AgentRuntimeKindRawCLI,
+					Exec:            loader.AgentExec{Command: rawPath},
+					SupportedStages: []rt.StageType{rt.StageTypeExecute, rt.StageTypeValidateFix},
+					Control: loader.AgentControl{
+						Cancel: true,
+						Kill:   true,
+					},
+				},
+			},
+		},
+	})
+
+	supervisor := NewTaskSupervisor(
+		taskStore, runStore, clarStore, registry, heartbeatMgr, eventSink,
+		ctxBuilder, promptBuilder, cfg, drivers, root,
+	)
+	orch := NewOrchestrator(taskStore, runStore, registry, eventSink, cfg, supervisor)
+	return orch, taskStore, runStore, agentctlDir
 }
 
 func createDraftTask(store *fsstore.TaskStore) {
@@ -119,6 +174,61 @@ func TestOrchestrator_Run_FullPipeline(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(runStore.RunDir("TASK-001", session.ID), "protocol.ndjson")); err != nil {
 		t.Fatalf("expected protocol log: %v", err)
+	}
+}
+
+func TestOrchestrator_Run_RawCLIProducesLogsAndClearFailure(t *testing.T) {
+	orch, store, runStore, _ := setupRawCLIOrchestrator(t, rawCLIScript())
+
+	now := time.Now()
+	_ = store.Save(&task.Task{
+		ID:     "TASK-001",
+		Title:  "Raw execution",
+		Goal:   "Say hello",
+		Status: task.StatusDraft,
+		Agent:  "raw",
+		PromptTemplates: task.PromptTemplates{
+			Builtin: []string{"strict_executor"},
+		},
+		Clarifications: task.Clarifications{Attached: []string{}},
+		Runtime:        task.DefaultRuntimeConfig(),
+		Validation:     task.ValidationConfig{Mode: task.ValidationModeSimple, Commands: []string{}},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+
+	if err := orch.Run(context.Background(), "TASK-001"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	tk, _ := store.Load("TASK-001")
+	if tk.Status != task.StatusFailed {
+		t.Fatalf("expected failed status after unsupported review stage, got %s", tk.Status)
+	}
+
+	session, err := runStore.LatestSession("TASK-001")
+	if err != nil {
+		t.Fatalf("latest session: %v", err)
+	}
+	if session.LastStage() == nil || session.LastStage().Type != rt.StageTypeReview {
+		t.Fatalf("expected blocked review stage, got %+v", session.LastStage())
+	}
+	if session.LastStage().Result == nil || session.LastStage().Result.Message == "" {
+		t.Fatalf("expected clear failure message for raw cli review stage")
+	}
+
+	stdoutPath := filepath.Join(runStore.StageDir("TASK-001", session.ID, "STAGE-001"), "raw.stdout.log")
+	stderrPath := filepath.Join(runStore.StageDir("TASK-001", session.ID, "STAGE-001"), "raw.stderr.log")
+	runtimeErrPath := filepath.Join(runStore.StageDir("TASK-001", session.ID, "STAGE-002"), "runtime_errors.log")
+
+	if data, err := os.ReadFile(stdoutPath); err != nil || len(data) == 0 {
+		t.Fatalf("expected raw stdout log, err=%v data=%q", err, data)
+	}
+	if data, err := os.ReadFile(stderrPath); err != nil || len(data) == 0 {
+		t.Fatalf("expected raw stderr log, err=%v data=%q", err, data)
+	}
+	if data, err := os.ReadFile(runtimeErrPath); err != nil || len(data) == 0 {
+		t.Fatalf("expected runtime error log for blocked review stage, err=%v data=%q", err, data)
 	}
 }
 
@@ -446,5 +556,13 @@ emit "${base},\"seq\":1,\"type\":\"hello\",\"payload\":{\"adapter_id\":\"fake\",
 emit "${base},\"seq\":2,\"type\":\"stage_started\",\"payload\":{\"type\":\"execute\"}}"
 emit "${base},\"seq\":3,\"type\":\"clarification_requested\",\"payload\":{\"request_id\":\"CLAR-REQ-001\",\"reason\":\"Need more input\",\"questions\":[{\"id\":\"q1\",\"text\":\"What edge case should be handled?\"}]}}"
 emit "${base},\"seq\":4,\"type\":\"stage_completed\",\"payload\":{\"result\":{\"outcome\":\"clarification_requested\"}}}"
+`
+}
+
+func rawCLIScript() string {
+	return `#!/bin/sh
+printf 'hello from raw cli\n'
+printf 'warning from raw cli\n' >&2
+exit 0
 `
 }

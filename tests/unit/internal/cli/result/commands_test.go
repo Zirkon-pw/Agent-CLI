@@ -24,7 +24,7 @@ func TestResultCmd_Structure(t *testing.T) {
 	for _, sub := range subs {
 		names[sub.Name()] = true
 	}
-	for _, expected := range []string{"show", "diff"} {
+	for _, expected := range []string{"show", "diff", "list"} {
 		if !names[expected] {
 			t.Errorf("missing subcommand: %s", expected)
 		}

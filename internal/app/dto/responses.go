@@ -13,19 +13,20 @@ type TaskSummary struct {
 
 // TaskDetail is a full view of a task.
 type TaskDetail struct {
-	ID              string
-	Title           string
-	Goal            string
-	Status          string
-	Agent           string
-	Templates       []string
-	Guidelines      []string
-	Scope           ScopeDTO
-	Validation      ValidationDTO
-	Runtime         RuntimeDTO
-	Clarifications  ClarificationsDTO
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	ID             string
+	Title          string
+	Goal           string
+	Status         string
+	Agent          string
+	Templates      []string
+	Guidelines     []string
+	Scope          ScopeDTO
+	Validation     ValidationDTO
+	Runtime        RuntimeDTO
+	Clarifications ClarificationsDTO
+	LatestSession  *SessionDetailDTO
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 type ValidationDTO struct {
@@ -44,6 +45,17 @@ type RuntimeDTO struct {
 type ClarificationsDTO struct {
 	PendingRequest *string
 	Attached       []string
+}
+
+type SessionDetailDTO struct {
+	ID            string
+	Status        string
+	Agent         string
+	LastStageID   string
+	LastStageType string
+	LastOutcome   string
+	LastError     string
+	ArtifactCount int
 }
 
 // RunSummary is a short view of a run.

@@ -70,14 +70,14 @@ func NewApp() (*App, error) {
 	registry := infrart.NewRegistry(agentctlDir)
 	heartbeatMgr := infrart.NewHeartbeatManager(agentctlDir)
 	eventSink := events.NewSink(filepath.Join(agentctlDir, "runtime"))
-	adapterRegistry := taskrunner.NewAgentAdapterRegistry(ws.Agents)
+	driverRegistry := taskrunner.NewAgentRuntimeRegistry(ws.Agents)
 
 	// Services
 	ctxBuilder := contextpack.NewBuilder(agentctlDir, projectRoot)
 	promptBuilder := prompting.NewBuilder(templateStore, agentctlDir)
 	supervisor := taskrunner.NewTaskSupervisor(
 		taskStore, runStore, clarStore, registry, heartbeatMgr, eventSink,
-		ctxBuilder, promptBuilder, ws.Config, adapterRegistry, projectRoot,
+		ctxBuilder, promptBuilder, ws.Config, driverRegistry, projectRoot,
 	)
 
 	orchestrator := taskrunner.NewOrchestrator(
@@ -94,7 +94,7 @@ func NewApp() (*App, error) {
 
 	// Queries
 	listTasks := query.NewListTasks(taskStore)
-	inspectTask := query.NewInspectTask(taskStore)
+	inspectTask := query.NewInspectTask(taskStore, runStore)
 
 	return &App{
 		TaskStore:     taskStore,

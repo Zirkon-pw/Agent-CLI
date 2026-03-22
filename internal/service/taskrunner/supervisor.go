@@ -35,7 +35,7 @@ type TaskSupervisor struct {
 	contextBuilder *contextpack.Builder
 	promptBuilder  *prompting.Builder
 	config         *loader.ProjectConfig
-	adapters       *AgentAdapterRegistry
+	drivers        *AgentRuntimeRegistry
 	projectRoot    string
 }
 
@@ -50,7 +50,7 @@ func NewTaskSupervisor(
 	contextBuilder *contextpack.Builder,
 	promptBuilder *prompting.Builder,
 	config *loader.ProjectConfig,
-	adapters *AgentAdapterRegistry,
+	drivers *AgentRuntimeRegistry,
 	projectRoot string,
 ) *TaskSupervisor {
 	return &TaskSupervisor{
@@ -63,7 +63,7 @@ func NewTaskSupervisor(
 		contextBuilder: contextBuilder,
 		promptBuilder:  promptBuilder,
 		config:         config,
-		adapters:       adapters,
+		drivers:        drivers,
 		projectRoot:    projectRoot,
 	}
 }
@@ -188,6 +188,9 @@ func (s *TaskSupervisor) loadOrCreateSession(t *task.Task) (*rt.RunSession, erro
 func (s *TaskSupervisor) nextStageType(t *task.Task, session *rt.RunSession) (rt.StageType, error) {
 	if session.ReviewReport != nil || session.Status == rt.SessionStatusReviewing {
 		return "", nil
+	}
+	if session.BlockedStageType != "" {
+		return session.BlockedStageType, nil
 	}
 	if session.Status == rt.SessionStatusWaitingClarification {
 		if t.Clarifications.PendingRequest != nil {
@@ -317,14 +320,6 @@ func (s *TaskSupervisor) prepareStageSpec(t *task.Task, session *rt.RunSession, 
 }
 
 func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, session *rt.RunSession, spec *rt.StageSpec) error {
-	adapter, err := s.adapters.Get(spec.AgentID)
-	if err != nil {
-		return err
-	}
-	if err := s.validateCapabilities(adapter.Capabilities(), spec.Type); err != nil {
-		return err
-	}
-
 	stage := rt.StageRun{
 		StageID: spec.StageID,
 		Type:    spec.Type,
@@ -338,6 +333,9 @@ func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, sess
 	current.State = rt.StageStateRunning
 	current.StartedAt = &now
 
+	if session.BlockedStageType == spec.Type {
+		session.BlockedStageType = ""
+	}
 	session.CurrentStageID = spec.StageID
 	session.Status = rt.SessionStatusStageRunning
 	session.CurrentAgentID = spec.AgentID
@@ -345,21 +343,40 @@ func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, sess
 	t.Status = task.StatusStageRunning
 	t.UpdatedAt = now
 
+	runtimeErrLog, err := s.ensureRuntimeErrorArtifact(t.ID, session, spec)
+	if err != nil {
+		return err
+	}
+
 	if err := s.persistSession(t, session); err != nil {
 		return err
 	}
 
-	specPath := filepath.Join(spec.StageDir, "stage_spec.json")
-	handle, err := adapter.Start(ctx, spec, specPath)
+	driver, err := s.drivers.Get(spec.AgentID)
 	if err != nil {
-		return err
+		return s.failStage(t, session, current, runtimeErrLog, err, false)
+	}
+	if err := s.validateDriver(driver, spec.Type); err != nil {
+		return s.failStage(t, session, current, runtimeErrLog, err, true)
+	}
+
+	stdoutLog, stderrLog, err := s.ensureStageIOArtifacts(t.ID, session, spec, driver.Kind())
+	if err != nil {
+		return s.failStage(t, session, current, runtimeErrLog, err, false)
+	}
+
+	specPath := filepath.Join(spec.StageDir, "stage_spec.json")
+	handle, err := driver.Start(ctx, spec, specPath)
+	if err != nil {
+		return s.failStage(t, session, current, runtimeErrLog, err, false)
 	}
 	eventsCh := handle.Events()
+	stdoutCh := handle.Stdout()
 	stderrCh := handle.Stderr()
 	errorsCh := handle.Errors()
 	doneCh := handle.Done()
 
-	session.Capabilities = adapter.Capabilities()
+	session.Capabilities = driver.Capabilities()
 	session.Recovery.AdapterPID = handle.PID()
 	session.Recovery.ProcessGroupID = handle.ProcessGroupID()
 	session.Recovery.LastHeartbeatAt = now
@@ -379,7 +396,7 @@ func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, sess
 		ProcessGroupID: handle.ProcessGroupID(),
 		StartedAt:      now,
 		UpdatedAt:      now,
-		Capabilities:   adapter.Capabilities(),
+		Capabilities:   driver.Capabilities(),
 	}
 	if err := s.registry.RegisterRun(active); err != nil {
 		return err
@@ -392,64 +409,64 @@ func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, sess
 	ticker := time.NewTicker(time.Duration(t.Runtime.HeartbeatIntervalSec) * time.Second)
 	defer ticker.Stop()
 
-	stderrLog := filepath.Join(spec.StageDir, "adapter.stderr.log")
 	var gracefulDeadline *time.Time
 	stageCompleted := false
 	processExited := false
 	var processErr error
+	protocolStage := driver.Kind() == loader.AgentRuntimeKindProtocolAdapter
 
 	for !stageCompleted {
 		select {
 		case <-ctx.Done():
 			_ = handle.Kill()
-			current.State = rt.StageStateFailed
-			current.Result = &rt.StageResult{Outcome: "failed", Message: ctx.Err().Error()}
-			session.Status = rt.SessionStatusFailed
-			t.Status = task.StatusFailed
-			t.UpdatedAt = time.Now()
-			return s.persistSession(t, session)
+			return s.failStage(t, session, current, runtimeErrLog, ctx.Err(), false)
 
 		case ev, ok := <-eventsCh:
 			if !ok {
 				eventsCh = nil
-				if processExited && current.Result == nil {
-					if processErr != nil {
-						current.State = rt.StageStateFailed
-						current.Result = &rt.StageResult{Outcome: "failed", Message: processErr.Error()}
-						session.Status = rt.SessionStatusFailed
-						t.Status = task.StatusFailed
-					} else {
-						current.State = rt.StageStateCompleted
-						current.Result = &rt.StageResult{Outcome: "completed"}
-						session.Status = rt.SessionStatusQueued
-					}
+				if protocolStage && processExited && current.Result == nil {
+					return s.failStage(t, session, current, runtimeErrLog, protocolExitError(processErr), false)
+				}
+				if !protocolStage && processExited && stdoutCh == nil && stderrCh == nil && current.Result == nil {
+					s.applyRawProcessResult(session, current, t, processErr)
 					stageCompleted = true
 				}
 				continue
 			}
 			if err := s.handleProtocolEvent(t, session, current, spec, &ev); err != nil {
-				return err
+				return s.failStage(t, session, current, runtimeErrLog, err, false)
 			}
 			if ev.Type == rt.EventTypeStageCompleted {
 				stageCompleted = true
 			}
 
+		case line, ok := <-stdoutCh:
+			if ok && line != "" && stdoutLog != "" {
+				_ = appendFile(stdoutLog, line+"\n")
+			}
+			if !ok {
+				stdoutCh = nil
+				if !protocolStage && processExited && stderrCh == nil && current.Result == nil {
+					s.applyRawProcessResult(session, current, t, processErr)
+					stageCompleted = true
+				}
+			}
+
 		case line, ok := <-stderrCh:
-			if ok && line != "" {
+			if ok && line != "" && stderrLog != "" {
 				_ = appendFile(stderrLog, line+"\n")
 			}
 			if !ok {
 				stderrCh = nil
+				if !protocolStage && processExited && stdoutCh == nil && current.Result == nil {
+					s.applyRawProcessResult(session, current, t, processErr)
+					stageCompleted = true
+				}
 			}
 
 		case err, ok := <-errorsCh:
 			if ok && err != nil {
-				current.State = rt.StageStateFailed
-				current.Result = &rt.StageResult{Outcome: "failed", Message: err.Error()}
-				session.Status = rt.SessionStatusFailed
-				t.Status = task.StatusFailed
-				t.UpdatedAt = time.Now()
-				return s.persistSession(t, session)
+				return s.failStage(t, session, current, runtimeErrLog, err, false)
 			}
 			if !ok {
 				errorsCh = nil
@@ -463,17 +480,11 @@ func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, sess
 			processExited = true
 			processErr = err
 			doneCh = nil
-			if eventsCh == nil && current.Result == nil {
-				if err != nil {
-					current.State = rt.StageStateFailed
-					current.Result = &rt.StageResult{Outcome: "failed", Message: err.Error()}
-					session.Status = rt.SessionStatusFailed
-					t.Status = task.StatusFailed
-				} else {
-					current.Result = &rt.StageResult{Outcome: "completed"}
-					current.State = rt.StageStateCompleted
-					session.Status = rt.SessionStatusQueued
-				}
+			if protocolStage && eventsCh == nil && current.Result == nil {
+				return s.failStage(t, session, current, runtimeErrLog, protocolExitError(err), false)
+			}
+			if !protocolStage && eventsCh == nil && stdoutCh == nil && stderrCh == nil && current.Result == nil {
+				s.applyRawProcessResult(session, current, t, err)
 				stageCompleted = true
 			}
 
@@ -494,7 +505,7 @@ func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, sess
 					return err
 				}
 				if err := handle.Send(cmd); err != nil {
-					return err
+					return s.failStage(t, session, current, runtimeErrLog, err, false)
 				}
 				switch cmd.Type {
 				case rt.CommandTypePause:
@@ -572,7 +583,7 @@ func (s *TaskSupervisor) handleProtocolEvent(
 	case rt.EventTypeHello:
 		var payload rt.HelloPayload
 		if err := json.Unmarshal(ev.Payload, &payload); err == nil {
-			session.Capabilities = payload.Capabilities
+			session.Capabilities = intersectCapabilities(session.Capabilities, payload.Capabilities)
 		}
 	case rt.EventTypeProgress:
 		var payload rt.ProgressPayload
@@ -873,15 +884,153 @@ func (s *TaskSupervisor) persistSession(t *task.Task, session *rt.RunSession) er
 	return s.taskStore.Save(t)
 }
 
-func (s *TaskSupervisor) validateCapabilities(cap rt.AdapterCapabilities, stageType rt.StageType) error {
+func (s *TaskSupervisor) ensureRuntimeErrorArtifact(taskID string, session *rt.RunSession, spec *rt.StageSpec) (string, error) {
+	path := filepath.Join(spec.StageDir, "runtime_errors.log")
+	if err := touchFile(path); err != nil {
+		return "", err
+	}
+	session.ArtifactManifest.Add(rt.ArtifactRecord{
+		Name:      "runtime_errors.log",
+		Kind:      "runtime_error_log",
+		Path:      path,
+		StageID:   spec.StageID,
+		MediaType: "text/plain",
+		CreatedAt: time.Now(),
+	})
+	if err := s.runStore.SaveArtifactManifest(taskID, session.ID, &session.ArtifactManifest); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func (s *TaskSupervisor) ensureStageIOArtifacts(taskID string, session *rt.RunSession, spec *rt.StageSpec, kind loader.AgentRuntimeKind) (string, string, error) {
+	var stdoutLog string
+	var stderrLog string
+
+	switch kind {
+	case loader.AgentRuntimeKindProtocolAdapter:
+		protocolPath := filepath.Join(s.runStore.RunDir(taskID, session.ID), "protocol.ndjson")
+		if err := touchFile(protocolPath); err != nil {
+			return "", "", err
+		}
+		session.ArtifactManifest.Add(rt.ArtifactRecord{
+			Name:      "protocol.ndjson",
+			Kind:      "protocol_log",
+			Path:      protocolPath,
+			MediaType: "application/x-ndjson",
+			CreatedAt: time.Now(),
+		})
+		stderrLog = filepath.Join(spec.StageDir, "adapter.stderr.log")
+		if err := touchFile(stderrLog); err != nil {
+			return "", "", err
+		}
+		session.ArtifactManifest.Add(rt.ArtifactRecord{
+			Name:      "adapter.stderr.log",
+			Kind:      "stderr_log",
+			Path:      stderrLog,
+			StageID:   spec.StageID,
+			MediaType: "text/plain",
+			CreatedAt: time.Now(),
+		})
+	case loader.AgentRuntimeKindRawCLI:
+		stdoutLog = filepath.Join(spec.StageDir, "raw.stdout.log")
+		stderrLog = filepath.Join(spec.StageDir, "raw.stderr.log")
+		if err := touchFile(stdoutLog); err != nil {
+			return "", "", err
+		}
+		if err := touchFile(stderrLog); err != nil {
+			return "", "", err
+		}
+		session.ArtifactManifest.Add(rt.ArtifactRecord{
+			Name:      "raw.stdout.log",
+			Kind:      "stdout_log",
+			Path:      stdoutLog,
+			StageID:   spec.StageID,
+			MediaType: "text/plain",
+			CreatedAt: time.Now(),
+		})
+		session.ArtifactManifest.Add(rt.ArtifactRecord{
+			Name:      "raw.stderr.log",
+			Kind:      "stderr_log",
+			Path:      stderrLog,
+			StageID:   spec.StageID,
+			MediaType: "text/plain",
+			CreatedAt: time.Now(),
+		})
+	default:
+		return "", "", fmt.Errorf("unsupported runtime kind %q", kind)
+	}
+
+	if err := s.runStore.SaveArtifactManifest(taskID, session.ID, &session.ArtifactManifest); err != nil {
+		return "", "", err
+	}
+	return stdoutLog, stderrLog, nil
+}
+
+func (s *TaskSupervisor) failStage(
+	t *task.Task,
+	session *rt.RunSession,
+	stage *rt.StageRun,
+	runtimeErrorsPath string,
+	err error,
+	blockStage bool,
+) error {
+	if err == nil {
+		return s.persistSession(t, session)
+	}
+	if runtimeErrorsPath != "" {
+		_ = appendFile(runtimeErrorsPath, err.Error()+"\n")
+	}
+	now := time.Now()
+	stage.State = rt.StageStateFailed
+	stage.Result = &rt.StageResult{Outcome: "failed", Message: err.Error()}
+	stage.FinishedAt = &now
+	session.Status = rt.SessionStatusFailed
+	session.CurrentStageID = ""
+	session.PendingControlCommand = nil
+	session.UpdatedAt = now
+	if blockStage {
+		session.BlockedStageType = stage.Type
+	}
+	t.Status = task.StatusFailed
+	t.UpdatedAt = now
+	return s.persistSession(t, session)
+}
+
+func (s *TaskSupervisor) applyRawProcessResult(session *rt.RunSession, stage *rt.StageRun, t *task.Task, processErr error) {
+	if processErr == nil {
+		stage.State = rt.StageStateCompleted
+		stage.Result = &rt.StageResult{Outcome: "completed"}
+		session.Status = rt.SessionStatusQueued
+		return
+	}
+
+	stage.State = rt.StageStateFailed
+	stage.Result = rawProcessResult(processErr)
+	session.Status = rt.SessionStatusFailed
+	t.Status = task.StatusFailed
+	t.UpdatedAt = time.Now()
+}
+
+func (s *TaskSupervisor) validateDriver(driver AgentRuntimeDriver, stageType rt.StageType) error {
+	if !driver.SupportsStage(stageType) {
+		switch driver.Kind() {
+		case loader.AgentRuntimeKindRawCLI:
+			return fmt.Errorf("agent %s uses raw_cli runtime and does not support %s stage; route the task to a protocol-capable agent", driver.ID(), stageType)
+		default:
+			return fmt.Errorf("agent %s does not support %s stage", driver.ID(), stageType)
+		}
+	}
+
+	cap := driver.Capabilities()
 	switch stageType {
 	case rt.StageTypeReview:
 		if !cap.SupportsReview {
 			return fmt.Errorf("adapter does not support review stages")
 		}
 	case rt.StageTypeExecute, rt.StageTypeValidateFix:
-		if !cap.SupportsCancel || !cap.SupportsKill {
-			return fmt.Errorf("adapter must support cancel and kill control commands")
+		if !cap.SupportsKill {
+			return fmt.Errorf("adapter must support kill control commands")
 		}
 	}
 	return nil
@@ -910,6 +1059,44 @@ func (s *TaskSupervisor) materializeSessionArtifact(taskID, sessionID string, ar
 		return nil
 	}
 	return s.runStore.WriteArtifact(taskID, sessionID, artifact.Name, data)
+}
+
+func rawProcessResult(processErr error) *rt.StageResult {
+	if processErr == nil {
+		return &rt.StageResult{Outcome: "completed"}
+	}
+	result := &rt.StageResult{
+		Outcome: "failed",
+		Message: processErr.Error(),
+	}
+	if exitCode, ok := processExitCode(processErr); ok {
+		result.ExitCode = intPtr(exitCode)
+		result.Message = fmt.Sprintf("raw cli exited with code %d", exitCode)
+	}
+	return result
+}
+
+func protocolExitError(processErr error) error {
+	if processErr == nil {
+		return fmt.Errorf("protocol adapter exited before emitting stage_completed")
+	}
+	if exitCode, ok := processExitCode(processErr); ok {
+		return fmt.Errorf("protocol adapter exited with code %d before emitting stage_completed", exitCode)
+	}
+	return fmt.Errorf("protocol adapter exited before emitting stage_completed: %w", processErr)
+}
+
+func processExitCode(err error) (int, bool) {
+	type exitCoder interface {
+		ExitCode() int
+	}
+	if err == nil {
+		return 0, false
+	}
+	if exitErr, ok := err.(exitCoder); ok {
+		return exitErr.ExitCode(), true
+	}
+	return 0, false
 }
 
 func (s *TaskSupervisor) buildValidationFixPrompt(t *task.Task, results []validation.CheckResult, attempt, maxRetries int) string {
@@ -1009,4 +1196,28 @@ func appendFile(path, content string) error {
 	defer f.Close()
 	_, err = f.WriteString(content)
 	return err
+}
+
+func touchFile(path string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+func intersectCapabilities(configured, reported rt.AdapterCapabilities) rt.AdapterCapabilities {
+	result := configured
+	if reported.ProtocolVersion != "" {
+		result.ProtocolVersion = reported.ProtocolVersion
+	}
+	result.SupportsCancel = configured.SupportsCancel && reported.SupportsCancel
+	result.SupportsPause = configured.SupportsPause && reported.SupportsPause
+	result.SupportsResume = configured.SupportsResume && reported.SupportsResume
+	result.SupportsKill = configured.SupportsKill && reported.SupportsKill
+	result.SupportsHeartbeat = configured.SupportsHeartbeat && reported.SupportsHeartbeat
+	result.SupportsClarification = configured.SupportsClarification && reported.SupportsClarification
+	result.SupportsReview = configured.SupportsReview && reported.SupportsReview
+	result.SupportsHandoff = configured.SupportsHandoff && reported.SupportsHandoff
+	return result
 }

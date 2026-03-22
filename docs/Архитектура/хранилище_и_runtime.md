@@ -79,16 +79,21 @@ Task file должен оставаться основным снимком по
 
 ```text
 .agentctl/runs/TASK-001/RUN-001/
-  prompt.md
-  prompt_template_lock.yml
-  attached_clarifications.json
-  runtime.json
-  stdout.log
-  stderr.log
-  events.ndjson
-  diff.patch
+  metadata.json
+  session.json
+  protocol.ndjson
+  artifacts.json
   validation.json
-  result_summary.md
+  review_report.json
+  stages/
+    STAGE-001/
+      stage_spec.json
+      prompt.md
+      prompt_template_lock.yml
+      raw.stdout.log
+      raw.stderr.log
+      adapter.stderr.log
+      runtime_errors.log
 ```
 
 `validation.json` включает историю повторных попыток (retry history) при использовании режима `full` validation.
@@ -105,11 +110,9 @@ Task file должен оставаться основным снимком по
 .agentctl/runtime/
   active_runs.json
   TASK-001/
-    runtime.json
     heartbeat.json
     control.signal
     lock
-    events.ndjson
 ```
 
 Здесь удобно держать:
