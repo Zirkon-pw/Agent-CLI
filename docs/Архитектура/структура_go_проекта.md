@@ -155,7 +155,7 @@ Domain model.
 
 Примеры инвариантов:
 
-- нельзя `resume`, если задача не в `ready_to_resume`, `paused` или `stopped`;
+- нельзя продолжать задачу через `task run`, если она не в состоянии, пригодном для нового запуска;
 - нельзя `attach clarification`, если нет pending request;
 - нельзя `kill`, если нет активного run;
 - нельзя запускать несовместимые built-in templates в одной задаче.
@@ -220,7 +220,7 @@ internal/cli/
     create.go
     update.go
     run.go
-    resume.go
+    control.go
     inspect.go
     ps.go
     stop.go

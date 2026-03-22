@@ -117,7 +117,7 @@ Task file должен оставаться основным снимком по
 - список активных run;
 - heartbeat state;
 - locks;
-- stop, pause и kill signals;
+- stop и kill signals;
 - session mapping;
 - короткие runtime snapshots.
 
@@ -183,7 +183,7 @@ Runtime слой должен уметь:
 
 - восстанавливать state после рестарта;
 - не запускать два активных run на одну задачу;
-- различать graceful stop, pause и forced kill;
+- различать graceful stop и forced kill;
 - хранить отдельно run artifacts и live runtime state;
 - понимать, какие `.yml`-уточнения уже были прикреплены;
 - корректно завершать задачу, если clarification requested во время исполнения.
@@ -201,7 +201,7 @@ Runtime слой должен уметь:
 - template compatibility tests;
 - clarification attach tests;
 - task run orchestration tests;
-- stop, pause и kill behavior tests;
+- stop и kill behavior tests;
 - recovery tests после незавершенного run.
 
 Рекомендуемая раскладка:

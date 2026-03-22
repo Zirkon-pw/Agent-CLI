@@ -92,7 +92,7 @@ func newAttachCmd(mgr *clarificationflow.Manager) *cobra.Command {
 			}
 
 			fmt.Printf("Clarification attached to task %s\n", taskID)
-			fmt.Printf("Task is now ready to resume. Run: agentctl task resume %s\n", taskID)
+			fmt.Printf("Task is now ready to continue. Run: agentctl task run %s\n", taskID)
 			return nil
 		},
 	}

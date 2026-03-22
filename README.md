@@ -11,7 +11,7 @@ CLI-инструмент для управления инженерными за
 - **Уточнения** — структурированный YAML-flow, который материализуется supervisor-ом из protocol events
 - **Валидация** — два режима: `simple` (pass/fail) и `full` (автоматическое исправление агентом, до N ретраев)
 - **Наблюдаемость** — `ps`, `inspect`, `logs`, `events`, `watch` для мониторинга выполнения
-- **Управление** — `stop`, `kill`, `pause`, `resume`, `cancel` для контроля live-session и recovery
+- **Управление** — `stop`, `kill`, `cancel` и повторный `task run` для контроля live-session и recovery
 
 ## Требования
 
@@ -81,7 +81,6 @@ agentctl task reject TASK-001 --reason "не покрыто тестами"
 | `task create` | Создать draft-задачу, в том числе пустую |
 | `task update` | Донастроить задачу в статусе draft |
 | `task run` | Запустить или продолжить session pipeline |
-| `task resume` | Возобновить live pause или продолжить blocked session |
 | `task rerun` | Перезапустить задачу |
 | `task list` | Список всех задач |
 | `task inspect` | Детальная информация о задаче |
@@ -91,7 +90,6 @@ agentctl task reject TASK-001 --reason "не покрыто тестами"
 | `task watch` | Live-мониторинг |
 | `task stop` | Мягкая остановка |
 | `task kill` | Принудительная остановка |
-| `task pause` | Пауза |
 | `task cancel` | Отмена (для незапущенных) |
 | `task accept` | Принять результат |
 | `task reject` | Отклонить результат |
@@ -180,7 +178,7 @@ validation:
 2. Supervisor планирует следующий `stage`.
 3. Для stage пишется `stage_spec.json`.
 4. Adapter wrapper запускает внешний CLI-агент и общается с ним через NDJSON:
-   - `stdin` — control commands (`cancel`, `pause`, `resume`, `kill`, `ping`)
+   - `stdin` — control commands (`cancel`, `kill`, `ping` и другие protocol-level команды)
    - `stdout` — protocol events (`hello`, `progress`, `artifact`, `clarification_requested`, `review_report`, `stage_completed` и т.д.)
 5. Supervisor пишет сырой поток в `protocol.ndjson`, поддерживает `artifacts.json`, обновляет `session.json` и materialize-ит YAML-файлы уточнений для пользователя.
 
@@ -212,7 +210,7 @@ agentctl task update TASK-001 \
   --set runtime.max_execution_minutes=30
 ```
 
-Перед `task run` и `task resume` у задачи обязательно должны быть заполнены `title` и `goal`. Если `agent` или built-in шаблоны не заданы, они будут подставлены из project config во время запуска и сохранены обратно в task YAML.
+Перед `task run` у задачи обязательно должны быть заполнены `title` и `goal`. Если `agent` или built-in шаблоны не заданы, они будут подставлены из project config во время запуска и сохранены обратно в task YAML.
 
 ## Makefile
 

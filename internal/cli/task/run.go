@@ -11,7 +11,7 @@ import (
 func NewRunCmd(handler *command.RunTask) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "run <task-id>",
-		Short: "Execute a task with the assigned agent",
+		Short: "Start or continue a task session pipeline",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			taskID := args[0]

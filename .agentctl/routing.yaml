@@ -1,0 +1,7 @@
+routing:
+    - when: task.type == "architecture_refactor"
+      agent: claude
+    - when: task.type == "code_generation"
+      agent: codex
+    - when: task.type == "bulk_tests"
+      agent: qwen

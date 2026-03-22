@@ -76,29 +76,6 @@ func (o *Orchestrator) Run(ctx context.Context, taskID string) error {
 	return err
 }
 
-// Resume resumes a paused live session or continues the next blocked stage.
-func (o *Orchestrator) Resume(ctx context.Context, taskID string) error {
-	active, err := o.registry.LoadActiveRun(taskID)
-	if err != nil {
-		return err
-	}
-	if active != nil {
-		if !active.Capabilities.SupportsResume {
-			return fmt.Errorf("agent %s does not support resume", active.Agent)
-		}
-		return o.registry.AppendCommand(rt.ProtocolCommand{
-			SessionID: active.RunID,
-			TaskID:    taskID,
-			RunID:     active.RunID,
-			StageID:   active.StageID,
-			Seq:       time.Now().UnixNano(),
-			Timestamp: time.Now(),
-			Type:      rt.CommandTypeResume,
-		})
-	}
-	return o.Run(ctx, taskID)
-}
-
 // Stop sends a graceful cancel command to the live adapter session.
 func (o *Orchestrator) Stop(taskID string) error {
 	active, err := o.registry.LoadActiveRun(taskID)
@@ -156,38 +133,6 @@ func (o *Orchestrator) Kill(taskID string) error {
 	}
 	o.eventSink.Emit(taskID, active.RunID, "killed", "")
 	return nil
-}
-
-// Pause requests a live adapter stage to pause.
-func (o *Orchestrator) Pause(taskID string) error {
-	t, err := o.taskStore.Load(taskID)
-	if err != nil {
-		return err
-	}
-	if !t.Runtime.AllowPause {
-		return fmt.Errorf("pause is not allowed for task %s", taskID)
-	}
-
-	active, err := o.registry.LoadActiveRun(taskID)
-	if err != nil {
-		return err
-	}
-	if active == nil {
-		return fmt.Errorf("task %s is not running", taskID)
-	}
-	if !active.Capabilities.SupportsPause || !active.Capabilities.SupportsResume {
-		return fmt.Errorf("agent %s does not support pause/resume", active.Agent)
-	}
-	o.eventSink.Emit(taskID, active.RunID, "pause_requested", "")
-	return o.registry.AppendCommand(rt.ProtocolCommand{
-		SessionID: active.RunID,
-		TaskID:    taskID,
-		RunID:     active.RunID,
-		StageID:   active.StageID,
-		Seq:       time.Now().UnixNano(),
-		Timestamp: time.Now(),
-		Type:      rt.CommandTypePause,
-	})
 }
 
 // Cancel cancels a task that is not actively running.

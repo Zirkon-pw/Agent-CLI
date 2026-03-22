@@ -41,7 +41,6 @@ List:     agentctl task list
 Inspect:  agentctl task inspect TASK-001
 Stop:     agentctl task stop TASK-001
 Kill:     agentctl task kill TASK-001
-Resume:   agentctl task resume TASK-001
 Accept:   agentctl task accept TASK-001
 Reject:   agentctl task reject TASK-001`,
 
@@ -70,7 +69,7 @@ When a task has ambiguities, the agent can request clarification.
 3. Task transitions to waiting_clarification
 4. User fills answers in clarification file
 5. User attaches: agentctl clarification attach TASK-001 <path>
-6. Resume: agentctl task resume TASK-001`,
+6. Continue: agentctl task run TASK-001`,
 
 	"validation": `Validation
 ==========
@@ -103,5 +102,5 @@ With clarification:
 6. agentctl clarification show TASK-001
 7. (edit clarification YAML)
 8. agentctl clarification attach TASK-001 <path>
-9. agentctl task resume TASK-001`,
+9. agentctl task run TASK-001`,
 }

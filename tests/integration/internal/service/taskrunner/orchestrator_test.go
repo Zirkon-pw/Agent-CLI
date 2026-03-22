@@ -58,8 +58,6 @@ func setupOrchestrator(t *testing.T, script string) (*Orchestrator, *fsstore.Tas
 				Capabilities: rt.AdapterCapabilities{
 					ProtocolVersion:       "v1",
 					SupportsCancel:        true,
-					SupportsPause:         true,
-					SupportsResume:        true,
 					SupportsKill:          true,
 					SupportsHeartbeat:     true,
 					SupportsClarification: true,
@@ -262,8 +260,6 @@ func TestOrchestrator_Stop_QueuesCancelCommand(t *testing.T) {
 		Status: rt.SessionStatusStageRunning,
 		Capabilities: rt.AdapterCapabilities{
 			SupportsCancel: true,
-			SupportsPause:  true,
-			SupportsResume: true,
 			SupportsKill:   true,
 		},
 		StartedAt: now,
@@ -280,23 +276,6 @@ func TestOrchestrator_Stop_QueuesCancelCommand(t *testing.T) {
 	}
 	if len(commands) != 1 || commands[0].Type != rt.CommandTypeCancel {
 		t.Fatalf("expected one cancel command, got %+v", commands)
-	}
-}
-
-func TestOrchestrator_Pause_NotAllowed(t *testing.T) {
-	orch, store, _, _, _ := setupOrchestrator(t, fullPipelineAdapterScript())
-
-	now := time.Now()
-	_ = store.Save(&task.Task{
-		ID:        "TASK-001",
-		Status:    task.StatusStageRunning,
-		Runtime:   task.RuntimeConfig{AllowPause: false},
-		CreatedAt: now,
-		UpdatedAt: now,
-	})
-
-	if err := orch.Pause("TASK-001"); err == nil {
-		t.Fatal("expected error when pause not allowed")
 	}
 }
 
@@ -441,7 +420,7 @@ elif grep -q '"type":[[:space:]]*"validate_fix"' "$spec"; then
 fi
 emit() { printf '%s\n' "$1"; }
 base="{\"session_id\":\"$AGENTCTL_SESSION_ID\",\"task_id\":\"$AGENTCTL_TASK_ID\",\"run_id\":\"$AGENTCTL_SESSION_ID\",\"stage_id\":\"$AGENTCTL_STAGE_ID\",\"ts\":\"2026-03-22T00:00:00Z\""
-emit "${base},\"seq\":1,\"type\":\"hello\",\"payload\":{\"adapter_id\":\"fake\",\"capabilities\":{\"protocol_version\":\"v1\",\"supports_cancel\":true,\"supports_pause\":true,\"supports_resume\":true,\"supports_kill\":true,\"supports_heartbeat\":true,\"supports_clarification\":true,\"supports_review\":true,\"supports_handoff\":true}}}"
+emit "${base},\"seq\":1,\"type\":\"hello\",\"payload\":{\"adapter_id\":\"fake\",\"capabilities\":{\"protocol_version\":\"v1\",\"supports_cancel\":true,\"supports_kill\":true,\"supports_heartbeat\":true,\"supports_clarification\":true,\"supports_review\":true,\"supports_handoff\":true}}}"
 emit "${base},\"seq\":2,\"type\":\"stage_started\",\"payload\":{\"type\":\"$stage_type\"}}"
 if [ "$stage_type" = "review" ]; then
   printf '{"summary":"LGTM","findings":[]}\n' > "$AGENTCTL_SESSION_DIR/review_report.json"
@@ -463,7 +442,7 @@ func clarificationAdapterScript() string {
 	return `#!/bin/sh
 emit() { printf '%s\n' "$1"; }
 base="{\"session_id\":\"$AGENTCTL_SESSION_ID\",\"task_id\":\"$AGENTCTL_TASK_ID\",\"run_id\":\"$AGENTCTL_SESSION_ID\",\"stage_id\":\"$AGENTCTL_STAGE_ID\",\"ts\":\"2026-03-22T00:00:00Z\""
-emit "${base},\"seq\":1,\"type\":\"hello\",\"payload\":{\"adapter_id\":\"fake\",\"capabilities\":{\"protocol_version\":\"v1\",\"supports_cancel\":true,\"supports_pause\":true,\"supports_resume\":true,\"supports_kill\":true,\"supports_heartbeat\":true,\"supports_clarification\":true,\"supports_review\":true,\"supports_handoff\":true}}}"
+emit "${base},\"seq\":1,\"type\":\"hello\",\"payload\":{\"adapter_id\":\"fake\",\"capabilities\":{\"protocol_version\":\"v1\",\"supports_cancel\":true,\"supports_kill\":true,\"supports_heartbeat\":true,\"supports_clarification\":true,\"supports_review\":true,\"supports_handoff\":true}}}"
 emit "${base},\"seq\":2,\"type\":\"stage_started\",\"payload\":{\"type\":\"execute\"}}"
 emit "${base},\"seq\":3,\"type\":\"clarification_requested\",\"payload\":{\"request_id\":\"CLAR-REQ-001\",\"reason\":\"Need more input\",\"questions\":[{\"id\":\"q1\",\"text\":\"What edge case should be handled?\"}]}}"
 emit "${base},\"seq\":4,\"type\":\"stage_completed\",\"payload\":{\"result\":{\"outcome\":\"clarification_requested\"}}}"

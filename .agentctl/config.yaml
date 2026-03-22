@@ -1,0 +1,33 @@
+project:
+    name: my-project
+    language: go
+execution:
+    default_agent: claude
+    mode: strict
+prompting:
+    builtin_templates:
+        - clarify_if_needed
+        - plan_before_execution
+        - strict_executor
+        - research_only
+        - review_only
+    default_template: strict_executor
+    allow_multiple_templates: true
+clarifications:
+    dir: .agentctl/clarifications
+    strategy: by_yml_files
+    allow_multiple_files: true
+runtime:
+    max_parallel_tasks: 4
+    heartbeat_interval_sec: 5
+    stale_after_sec: 30
+    graceful_stop_timeout_sec: 20
+    allow_force_kill: true
+validation:
+    default_mode: simple
+    default_max_retries: 3
+    default_commands: []
+artifacts:
+    runs_dir: .agentctl/runs
+    context_dir: .agentctl/context
+    reviews_dir: .agentctl/reviews

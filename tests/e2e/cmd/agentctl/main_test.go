@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -84,6 +85,73 @@ func TestRun_InitAndTaskList(t *testing.T) {
 	listCmd.Dir = workDir
 	if out, err := listCmd.CombinedOutput(); err != nil {
 		t.Fatalf("task list failed: %v\n%s", err, out)
+	}
+}
+
+func TestRun_TaskHelpDoesNotExposePauseOrResume(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "agentctl")
+	root := projectRoot(t)
+
+	build := exec.Command("go", "build", "-o", bin, "./cmd/agentctl")
+	build.Dir = root
+	build.Env = buildEnv(root)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+
+	workDir := t.TempDir()
+	initCmd := exec.Command(bin, "init")
+	initCmd.Dir = workDir
+	if out, err := initCmd.CombinedOutput(); err != nil {
+		t.Fatalf("init failed: %v\n%s", err, out)
+	}
+
+	cmd := exec.Command(bin, "task", "--help")
+	cmd.Dir = workDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("task help failed: %v\n%s", err, out)
+	}
+
+	output := string(out)
+	if strings.Contains(output, "pause") {
+		t.Fatalf("task help should not expose pause command, got:\n%s", output)
+	}
+	if strings.Contains(output, "resume") {
+		t.Fatalf("task help should not expose resume command, got:\n%s", output)
+	}
+}
+
+func TestRun_TaskPauseAndResumeAreUnknownCommands(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "agentctl")
+	root := projectRoot(t)
+
+	build := exec.Command("go", "build", "-o", bin, "./cmd/agentctl")
+	build.Dir = root
+	build.Env = buildEnv(root)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+
+	workDir := t.TempDir()
+	initCmd := exec.Command(bin, "init")
+	initCmd.Dir = workDir
+	if out, err := initCmd.CombinedOutput(); err != nil {
+		t.Fatalf("init failed: %v\n%s", err, out)
+	}
+
+	for _, args := range [][]string{{"task", "pause", "TASK-001"}, {"task", "resume", "TASK-001"}} {
+		cmd := exec.Command(bin, args...)
+		cmd.Dir = workDir
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatalf("expected %v to fail as unknown command", args)
+		}
+		if !strings.Contains(string(out), "unknown command") {
+			t.Fatalf("expected unknown command for %v, got:\n%s", args, out)
+		}
 	}
 }
 

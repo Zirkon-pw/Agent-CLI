@@ -45,6 +45,12 @@ func main() {
 		taskCmd := &cobra.Command{
 			Use:   "task",
 			Short: "Manage tasks",
+			RunE: func(cmd *cobra.Command, args []string) error {
+				if len(args) > 0 {
+					return fmt.Errorf("unknown command %q for %q", args[0], cmd.CommandPath())
+				}
+				return cmd.Help()
+			},
 		}
 		taskCmd.AddCommand(clitask.NewCreateCmd(app.CreateTask))
 		taskCmd.AddCommand(clitask.NewRunCmd(app.RunTask))
@@ -53,9 +59,7 @@ func main() {
 		taskCmd.AddCommand(clitask.NewPsCmd(app.RuntimeMgr))
 		taskCmd.AddCommand(clitask.NewStopCmd(app.Orchestrator))
 		taskCmd.AddCommand(clitask.NewKillCmd(app.Orchestrator))
-		taskCmd.AddCommand(clitask.NewPauseCmd(app.Orchestrator))
 		taskCmd.AddCommand(clitask.NewCancelCmd(app.Orchestrator))
-		taskCmd.AddCommand(clitask.NewResumeCmd(app.Orchestrator))
 		taskCmd.AddCommand(clitask.NewAcceptCmd(app.Orchestrator))
 		taskCmd.AddCommand(clitask.NewRejectCmd(app.Orchestrator))
 		taskCmd.AddCommand(clitask.NewRerunCmd(app.Orchestrator))

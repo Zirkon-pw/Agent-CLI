@@ -1,0 +1,109 @@
+agents:
+    - id: claude
+      role: executor
+      specialization:
+        - architecture_refactor
+        - deep_analysis
+      strengths:
+        - large_context_reasoning
+        - architecture_review
+      speed: medium
+      cost: high
+      context_limit: large
+      modes:
+        - strict
+        - research
+      tools:
+        - filesystem
+        - git
+      command: claude
+      args:
+        - -p
+      transport: ndjson_stdio
+      adapter_command: claude
+      adapter_args:
+        - -p
+      capabilities:
+        protocol_version: v1
+        supports_cancel: true
+        supports_pause: false
+        supports_resume: false
+        supports_kill: true
+        supports_heartbeat: false
+        supports_clarification: false
+        supports_review: false
+        supports_handoff: false
+      child_cli_command: claude
+      child_cli_args:
+        - -p
+    - id: codex
+      role: executor
+      specialization:
+        - code_generation
+        - task_execution
+      strengths:
+        - code_edits
+        - terminal_workflow
+      speed: high
+      cost: medium
+      context_limit: medium
+      modes:
+        - strict
+        - fast
+      tools:
+        - filesystem
+        - terminal
+      command: codex
+      args:
+        - -q
+      transport: ndjson_stdio
+      adapter_command: codex
+      adapter_args:
+        - -q
+      capabilities:
+        protocol_version: v1
+        supports_cancel: true
+        supports_pause: false
+        supports_resume: false
+        supports_kill: true
+        supports_heartbeat: false
+        supports_clarification: false
+        supports_review: false
+        supports_handoff: false
+      child_cli_command: codex
+      child_cli_args:
+        - -q
+    - id: qwen
+      role: executor
+      specialization:
+        - bulk_tests
+        - code_generation
+      strengths:
+        - fast_generation
+        - code_edits
+      speed: high
+      cost: low
+      context_limit: medium
+      modes:
+        - strict
+        - fast
+      tools:
+        - filesystem
+        - terminal
+      command: qwen
+      args: []
+      transport: ndjson_stdio
+      adapter_command: qwen
+      adapter_args: []
+      capabilities:
+        protocol_version: v1
+        supports_cancel: true
+        supports_pause: false
+        supports_resume: false
+        supports_kill: true
+        supports_heartbeat: false
+        supports_clarification: false
+        supports_review: false
+        supports_handoff: false
+      child_cli_command: qwen
+      child_cli_args: []
