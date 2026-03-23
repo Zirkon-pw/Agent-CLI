@@ -24,7 +24,7 @@ func setupRunner(t *testing.T) (*Runner, string) {
 
 	agentExec := executor.NewAgentExecutor(&loader.AgentsConfig{
 		Agents: []loader.AgentDef{
-			{ID: "echo", Runtime: loader.AgentRuntime{Exec: loader.AgentExec{Command: "echo", Args: []string{}}}},
+			{ID: "echo", Driver: loader.AgentDriverClaude, Command: "echo", Args: []string{}},
 		},
 	})
 	runStore := fsstore.NewRunStore(agentctlDir)

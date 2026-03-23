@@ -12,7 +12,7 @@ import (
 	rt "github.com/docup/agentctl/internal/core/runtime"
 )
 
-// Registry manages active session tracking and persisted control commands.
+// Registry manages active session tracking and legacy signal files.
 type Registry struct {
 	baseDir string // .agentctl/runtime
 	mu      sync.Mutex
@@ -106,7 +106,6 @@ func (r *Registry) UnregisterRun(taskID, runID string) error {
 	_ = os.Remove(filepath.Join(taskDir, "runtime.json"))
 	_ = os.Remove(filepath.Join(taskDir, "heartbeat.json"))
 	_ = os.Remove(filepath.Join(taskDir, "control.signal"))
-	_ = os.Remove(filepath.Join(taskDir, "commands.ndjson"))
 
 	return r.removeFromActiveRuns(taskID, runID)
 }
@@ -141,83 +140,16 @@ func (r *Registry) IsLocked(taskID string) bool {
 	return err == nil
 }
 
-// AppendCommand appends a machine-readable control command for a running session.
-func (r *Registry) AppendCommand(cmd rt.ProtocolCommand) error {
+// WriteSignal writes a simple legacy control signal file for a task.
+func (r *Registry) WriteSignal(taskID string, signal rt.Signal) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	taskDir := filepath.Join(r.baseDir, cmd.TaskID)
+	taskDir := filepath.Join(r.baseDir, taskID)
 	if err := os.MkdirAll(taskDir, 0755); err != nil {
 		return err
 	}
-
-	data, err := json.Marshal(cmd)
-	if err != nil {
-		return err
-	}
-	f, err := os.OpenFile(filepath.Join(taskDir, "commands.ndjson"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if _, err := f.Write(append(data, '\n')); err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(taskDir, "control.signal"), []byte(commandTypeToLegacySignal(cmd.Type)), 0644)
-}
-
-// CommandsAfter reads queued protocol commands after the given sequence number.
-func (r *Registry) CommandsAfter(taskID string, seq int64) ([]rt.ProtocolCommand, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	data, err := os.ReadFile(filepath.Join(r.baseDir, taskID, "commands.ndjson"))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	lines := splitLines(data)
-	var commands []rt.ProtocolCommand
-	for _, line := range lines {
-		if len(line) == 0 {
-			continue
-		}
-		var cmd rt.ProtocolCommand
-		if err := json.Unmarshal(line, &cmd); err != nil {
-			return nil, err
-		}
-		if cmd.Seq > seq {
-			commands = append(commands, cmd)
-		}
-	}
-	return commands, nil
-}
-
-// WriteSignal writes a legacy control signal by translating it into a protocol command.
-func (r *Registry) WriteSignal(taskID string, signal rt.Signal) error {
-	active, err := r.LoadActiveRun(taskID)
-	if err != nil {
-		return err
-	}
-	runID := ""
-	stageID := ""
-	seq := time.Now().UnixNano()
-	if active != nil {
-		runID = active.RunID
-		stageID = active.StageID
-	}
-	return r.AppendCommand(rt.ProtocolCommand{
-		SessionID: runID,
-		TaskID:    taskID,
-		RunID:     runID,
-		StageID:   stageID,
-		Seq:       seq,
-		Timestamp: time.Now(),
-		Type:      legacySignalToCommandType(signal),
-	})
+	return os.WriteFile(filepath.Join(taskDir, "control.signal"), []byte(signal), 0644)
 }
 
 // ReadSignal reads the current legacy control signal for a task.
@@ -283,32 +215,6 @@ func (r *Registry) removeFromActiveRuns(taskID, runID string) error {
 		return err
 	}
 	return os.WriteFile(path, data, 0644)
-}
-
-func legacySignalToCommandType(signal rt.Signal) rt.ProtocolCommandType {
-	switch signal {
-	case rt.SignalPause:
-		return rt.CommandTypePause
-	case rt.SignalKill:
-		return rt.CommandTypeKill
-	default:
-		return rt.CommandTypeCancel
-	}
-}
-
-func commandTypeToLegacySignal(cmd rt.ProtocolCommandType) string {
-	switch cmd {
-	case rt.CommandTypePause:
-		return string(rt.SignalPause)
-	case rt.CommandTypeKill:
-		return string(rt.SignalKill)
-	case rt.CommandTypeResume:
-		return "resume"
-	case rt.CommandTypePing:
-		return "ping"
-	default:
-		return string(rt.SignalStop)
-	}
 }
 
 func splitLines(data []byte) [][]byte {

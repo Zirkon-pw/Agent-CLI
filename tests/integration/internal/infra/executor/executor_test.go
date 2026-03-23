@@ -14,8 +14,8 @@ import (
 func TestNewAgentExecutor(t *testing.T) {
 	cfg := &loader.AgentsConfig{
 		Agents: []loader.AgentDef{
-			{ID: "claude", Runtime: loader.AgentRuntime{Exec: loader.AgentExec{Command: "claude", Args: []string{"-p"}}}},
-			{ID: "codex", Runtime: loader.AgentRuntime{Exec: loader.AgentExec{Command: "codex", Args: []string{"-q"}}}},
+			{ID: "claude", Driver: loader.AgentDriverClaude, Command: "claude", Args: []string{"-p"}},
+			{ID: "codex", Driver: loader.AgentDriverCodex, Command: "codex", Args: []string{"-q"}},
 		},
 	}
 	exec := NewAgentExecutor(cfg)
@@ -35,7 +35,7 @@ func TestExecute_UnknownAgent(t *testing.T) {
 func TestExecute_Echo(t *testing.T) {
 	cfg := &loader.AgentsConfig{
 		Agents: []loader.AgentDef{
-			{ID: "echo", Runtime: loader.AgentRuntime{Exec: loader.AgentExec{Command: "echo", Args: []string{}}}},
+			{ID: "echo", Driver: loader.AgentDriverClaude, Command: "echo", Args: []string{}},
 		},
 	}
 	exec := NewAgentExecutor(cfg)
@@ -58,7 +58,7 @@ func TestExecute_Echo(t *testing.T) {
 func TestExecute_NonZeroExit(t *testing.T) {
 	cfg := &loader.AgentsConfig{
 		Agents: []loader.AgentDef{
-			{ID: "fail", Runtime: loader.AgentRuntime{Exec: loader.AgentExec{Command: "sh", Args: []string{"-c", "exit 42; #"}}}},
+			{ID: "fail", Driver: loader.AgentDriverClaude, Command: "sh", Args: []string{"-c", "exit 42; #"}},
 		},
 	}
 	exec := NewAgentExecutor(cfg)
@@ -75,7 +75,7 @@ func TestExecute_NonZeroExit(t *testing.T) {
 func TestExecute_ContextCancel(t *testing.T) {
 	cfg := &loader.AgentsConfig{
 		Agents: []loader.AgentDef{
-			{ID: "sleep", Runtime: loader.AgentRuntime{Exec: loader.AgentExec{Command: "sleep", Args: []string{}}}},
+			{ID: "sleep", Driver: loader.AgentDriverClaude, Command: "sleep", Args: []string{}},
 		},
 	}
 	exec := NewAgentExecutor(cfg)
@@ -95,7 +95,7 @@ func TestExecuteWithPromptFile_CreatesPromptAndPassesContract(t *testing.T) {
 
 	exec := NewAgentExecutor(&loader.AgentsConfig{
 		Agents: []loader.AgentDef{
-			{ID: "echo", Runtime: loader.AgentRuntime{Exec: loader.AgentExec{Command: "echo"}}},
+			{ID: "echo", Driver: loader.AgentDriverClaude, Command: "echo"},
 		},
 	})
 

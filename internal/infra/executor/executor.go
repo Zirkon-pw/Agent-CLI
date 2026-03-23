@@ -41,12 +41,16 @@ func (e *AgentExecutor) Execute(ctx context.Context, agentID, prompt, workDir st
 		return nil, fmt.Errorf("unknown agent: %s", agentID)
 	}
 
-	args := make([]string, len(agent.Runtime.Exec.Args))
-	copy(args, agent.Runtime.Exec.Args)
+	args := make([]string, len(agent.Args))
+	copy(args, agent.Args)
 	args = append(args, prompt)
 
-	cmd := exec.CommandContext(ctx, agent.Runtime.Exec.Command, args...)
+	cmd := exec.CommandContext(ctx, agent.Command, args...)
 	cmd.Dir = workDir
+	cmd.Env = os.Environ()
+	for key, value := range agent.Env {
+		cmd.Env = append(cmd.Env, key+"="+value)
+	}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

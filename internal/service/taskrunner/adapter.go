@@ -8,194 +8,143 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 
 	"github.com/docup/agentctl/internal/config/loader"
+	"github.com/docup/agentctl/internal/core/clarification"
 	rt "github.com/docup/agentctl/internal/core/runtime"
 )
 
-// AgentRuntimeDriver launches an agent according to its configured runtime kind.
-type AgentRuntimeDriver interface {
-	ID() string
-	Kind() loader.AgentRuntimeKind
-	Capabilities() rt.AdapterCapabilities
+const (
+	resultBeginMarker = "AGENTCTL_RESULT_BEGIN"
+	resultEndMarker   = "AGENTCTL_RESULT_END"
+)
+
+// AgentCLIDriver encapsulates CLI-specific invocation and output parsing logic.
+type AgentCLIDriver interface {
+	Name() loader.AgentDriver
 	SupportsStage(rt.StageType) bool
-	Start(ctx context.Context, spec *rt.StageSpec, specPath string) (DriverHandle, error)
+	BuildStagePrompt(basePrompt string, spec *rt.StageSpec, session *rt.RunSession) (string, error)
+	BuildInvocation(profile loader.AgentDef, spec *rt.StageSpec, session *rt.RunSession, prompt string) (*CLIInvocation, error)
+	ParseStageOutput(spec *rt.StageSpec, capture *StageCapture) (*ParsedStageOutput, error)
 }
 
-// DriverHandle represents a live driver process.
+// CLIInvocation is a concrete process invocation produced by a driver.
+type CLIInvocation struct {
+	Command           string
+	Args              []string
+	Env               []string
+	StructuredLogName string
+}
+
+// ParsedStageOutput is the normalized outcome produced by a CLI driver.
+type ParsedStageOutput struct {
+	Result            rt.StageResult
+	Summary           string
+	ReviewReport      *rt.ReviewReport
+	Clarification     *ParsedClarification
+	StructuredLogName string
+	StructuredLog     []byte
+	ExternalSessionID string
+}
+
+// ParsedClarification is the normalized clarification request extracted from CLI output.
+type ParsedClarification struct {
+	RequestID   string
+	Reason      string
+	Questions   []clarification.Question
+	ContextRefs []string
+}
+
+// StageCapture contains the raw captured process output.
+type StageCapture struct {
+	Stdout     string
+	Stderr     string
+	ProcessErr error
+}
+
+// DriverHandle represents a live CLI process.
 type DriverHandle interface {
 	PID() int
 	ProcessGroupID() int
-	Events() <-chan rt.ProtocolEvent
 	Stdout() <-chan string
 	Stderr() <-chan string
-	Errors() <-chan error
 	Done() <-chan error
-	Send(rt.ProtocolCommand) error
+	Stop() error
 	Kill() error
 }
 
-// AgentRuntimeRegistry resolves configured agent drivers.
-type AgentRuntimeRegistry struct {
-	agents map[string]loader.AgentDef
+// AgentDriverRegistry resolves configured agent profiles to built-in CLI drivers.
+type AgentDriverRegistry struct {
+	profiles map[string]loader.AgentDef
+	drivers  map[loader.AgentDriver]AgentCLIDriver
 }
 
-// NewAgentRuntimeRegistry creates a registry from agents.yaml definitions.
-func NewAgentRuntimeRegistry(cfg *loader.AgentsConfig) *AgentRuntimeRegistry {
-	agents := make(map[string]loader.AgentDef, len(cfg.Agents))
+// NewAgentDriverRegistry creates a code-first driver registry from agents.yaml profiles.
+func NewAgentDriverRegistry(cfg *loader.AgentsConfig) *AgentDriverRegistry {
+	profiles := make(map[string]loader.AgentDef, len(cfg.Agents))
 	for _, agent := range cfg.Agents {
-		agents[agent.ID] = agent
+		profiles[agent.ID] = agent
 	}
-	return &AgentRuntimeRegistry{agents: agents}
+	return &AgentDriverRegistry{
+		profiles: profiles,
+		drivers: map[loader.AgentDriver]AgentCLIDriver{
+			loader.AgentDriverClaude: newClaudeDriver(),
+			loader.AgentDriverCodex:  newCodexDriver(),
+			loader.AgentDriverQwen:   newQwenDriver(),
+		},
+	}
 }
 
-// Get returns the driver configured for a specific agent.
-func (r *AgentRuntimeRegistry) Get(agentID string) (AgentRuntimeDriver, error) {
-	def, ok := r.agents[agentID]
+// AgentRuntimeRegistry is a compatibility alias for the old registry name.
+type AgentRuntimeRegistry = AgentDriverRegistry
+
+// NewAgentRuntimeRegistry preserves the old constructor name while returning the new code-first registry.
+func NewAgentRuntimeRegistry(cfg *loader.AgentsConfig) *AgentRuntimeRegistry {
+	return NewAgentDriverRegistry(cfg)
+}
+
+// Resolve returns the configured profile and its built-in driver.
+func (r *AgentDriverRegistry) Resolve(agentID string) (loader.AgentDef, AgentCLIDriver, error) {
+	profile, ok := r.profiles[agentID]
 	if !ok {
-		return nil, fmt.Errorf("unknown agent: %s", agentID)
+		return loader.AgentDef{}, nil, fmt.Errorf("unknown agent: %s", agentID)
 	}
-
-	switch def.Runtime.Kind {
-	case loader.AgentRuntimeKindProtocolAdapter:
-		return &protocolAdapterDriver{def: def}, nil
-	case loader.AgentRuntimeKindRawCLI:
-		return &rawCLIDriver{def: def}, nil
-	default:
-		return nil, fmt.Errorf("agent %s uses unsupported runtime.kind %q", agentID, def.Runtime.Kind)
+	driver, ok := r.drivers[profile.Driver]
+	if !ok {
+		return loader.AgentDef{}, nil, fmt.Errorf("agent %s uses unsupported driver %q", agentID, profile.Driver)
 	}
+	return profile, driver, nil
 }
 
-type protocolAdapterDriver struct {
-	def loader.AgentDef
-}
-
-func (d *protocolAdapterDriver) ID() string {
-	return d.def.ID
-}
-
-func (d *protocolAdapterDriver) Kind() loader.AgentRuntimeKind {
-	return d.def.Runtime.Kind
-}
-
-func (d *protocolAdapterDriver) Capabilities() rt.AdapterCapabilities {
-	return d.def.Capabilities()
-}
-
-func (d *protocolAdapterDriver) SupportsStage(stage rt.StageType) bool {
-	return d.def.SupportsStage(stage)
-}
-
-func (d *protocolAdapterDriver) Start(ctx context.Context, spec *rt.StageSpec, specPath string) (DriverHandle, error) {
-	args := append([]string{}, d.def.Runtime.Exec.Args...)
-	args = append(args, specPath)
-
-	cmd := exec.CommandContext(ctx, d.def.Runtime.Exec.Command, args...)
+// Start launches the CLI invocation as a managed process.
+func StartCLIProcess(ctx context.Context, spec *rt.StageSpec, invocation *CLIInvocation, profile loader.AgentDef) (DriverHandle, error) {
+	cmd := exec.CommandContext(ctx, invocation.Command, invocation.Args...)
 	cmd.Dir = spec.WorkDir
-	cmd.Env = append(os.Environ(), buildStageEnv(spec, specPath, d.def)...)
+	cmd.Env = append(os.Environ(), buildStageEnv(spec, profile)...)
+	cmd.Env = append(cmd.Env, invocation.Env...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("opening adapter stdout: %w", err)
+		return nil, fmt.Errorf("opening stdout: %w", err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, fmt.Errorf("opening adapter stderr: %w", err)
+		return nil, fmt.Errorf("opening stderr: %w", err)
 	}
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, fmt.Errorf("opening adapter stdin: %w", err)
-	}
-
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("starting adapter %s: %w", d.def.ID, err)
+		return nil, fmt.Errorf("starting %s driver process: %w", profile.ID, err)
 	}
 
 	pgid, _ := syscall.Getpgid(cmd.Process.Pid)
-	stdoutCh := make(chan string)
-	close(stdoutCh)
 	handle := &driverHandle{
 		cmd:    cmd,
 		pgid:   pgid,
-		stdin:  stdin,
-		kind:   loader.AgentRuntimeKindProtocolAdapter,
-		events: make(chan rt.ProtocolEvent, 32),
-		stdout: stdoutCh,
-		stderr: make(chan string, 32),
-		errors: make(chan error, 8),
-		done:   make(chan error, 1),
-	}
-	go handle.readProtocolEvents(stdout)
-	go handle.readLines(stderr, handle.stderr)
-	go handle.wait()
-	return handle, nil
-}
-
-type rawCLIDriver struct {
-	def loader.AgentDef
-}
-
-func (d *rawCLIDriver) ID() string {
-	return d.def.ID
-}
-
-func (d *rawCLIDriver) Kind() loader.AgentRuntimeKind {
-	return d.def.Runtime.Kind
-}
-
-func (d *rawCLIDriver) Capabilities() rt.AdapterCapabilities {
-	return d.def.Capabilities()
-}
-
-func (d *rawCLIDriver) SupportsStage(stage rt.StageType) bool {
-	return d.def.SupportsStage(stage)
-}
-
-func (d *rawCLIDriver) Start(ctx context.Context, spec *rt.StageSpec, specPath string) (DriverHandle, error) {
-	promptArg, err := rawPromptArg(spec, specPath)
-	if err != nil {
-		return nil, err
-	}
-
-	args := append([]string{}, d.def.Runtime.Exec.Args...)
-	if promptArg != "" {
-		args = append(args, promptArg)
-	}
-
-	cmd := exec.CommandContext(ctx, d.def.Runtime.Exec.Command, args...)
-	cmd.Dir = spec.WorkDir
-	cmd.Env = append(os.Environ(), buildStageEnv(spec, specPath, d.def)...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("opening raw stdout: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("opening raw stderr: %w", err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("starting raw cli %s: %w", d.def.ID, err)
-	}
-
-	pgid, _ := syscall.Getpgid(cmd.Process.Pid)
-	eventsCh := make(chan rt.ProtocolEvent)
-	close(eventsCh)
-	handle := &driverHandle{
-		cmd:    cmd,
-		pgid:   pgid,
-		kind:   loader.AgentRuntimeKindRawCLI,
-		events: eventsCh,
-		stdout: make(chan string, 32),
-		stderr: make(chan string, 32),
-		errors: make(chan error, 8),
+		stdout: make(chan string, 64),
+		stderr: make(chan string, 64),
 		done:   make(chan error, 1),
 	}
 	go handle.readLines(stdout, handle.stdout)
@@ -207,12 +156,8 @@ func (d *rawCLIDriver) Start(ctx context.Context, spec *rt.StageSpec, specPath s
 type driverHandle struct {
 	cmd    *exec.Cmd
 	pgid   int
-	stdin  io.WriteCloser
-	kind   loader.AgentRuntimeKind
-	events chan rt.ProtocolEvent
 	stdout chan string
 	stderr chan string
-	errors chan error
 	done   chan error
 	mu     sync.Mutex
 }
@@ -224,161 +169,345 @@ func (h *driverHandle) PID() int {
 	return h.cmd.Process.Pid
 }
 
-func (h *driverHandle) ProcessGroupID() int {
-	return h.pgid
-}
+func (h *driverHandle) ProcessGroupID() int   { return h.pgid }
+func (h *driverHandle) Stdout() <-chan string { return h.stdout }
+func (h *driverHandle) Stderr() <-chan string { return h.stderr }
+func (h *driverHandle) Done() <-chan error    { return h.done }
 
-func (h *driverHandle) Events() <-chan rt.ProtocolEvent {
-	return h.events
-}
-
-func (h *driverHandle) Stdout() <-chan string {
-	return h.stdout
-}
-
-func (h *driverHandle) Stderr() <-chan string {
-	return h.stderr
-}
-
-func (h *driverHandle) Errors() <-chan error {
-	return h.errors
-}
-
-func (h *driverHandle) Done() <-chan error {
-	return h.done
-}
-
-func (h *driverHandle) Send(cmd rt.ProtocolCommand) error {
-	switch h.kind {
-	case loader.AgentRuntimeKindProtocolAdapter:
-		h.mu.Lock()
-		defer h.mu.Unlock()
-
-		data, err := json.Marshal(cmd)
-		if err != nil {
-			return err
-		}
-		if _, err := h.stdin.Write(append(data, '\n')); err != nil {
-			return err
-		}
-		return nil
-	case loader.AgentRuntimeKindRawCLI:
-		switch cmd.Type {
-		case rt.CommandTypeCancel:
-			return h.signal(syscall.SIGTERM)
-		case rt.CommandTypeKill:
-			return h.signal(syscall.SIGKILL)
-		case rt.CommandTypePing:
-			return nil
-		default:
-			return fmt.Errorf("raw cli runtime does not support %s control", cmd.Type)
-		}
-	default:
-		return fmt.Errorf("unsupported runtime kind %q", h.kind)
+func (h *driverHandle) Stop() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.pgid > 0 {
+		return syscall.Kill(-h.pgid, syscall.SIGTERM)
 	}
-}
-
-func (h *driverHandle) Kill() error {
-	return h.signal(syscall.SIGKILL)
-}
-
-func (h *driverHandle) signal(sig syscall.Signal) error {
 	if h.cmd.Process == nil {
 		return nil
 	}
+	return h.cmd.Process.Signal(syscall.SIGTERM)
+}
+
+func (h *driverHandle) Kill() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.pgid > 0 {
-		return syscall.Kill(-h.pgid, sig)
+		return syscall.Kill(-h.pgid, syscall.SIGKILL)
 	}
-	return h.cmd.Process.Signal(sig)
+	if h.cmd.Process == nil {
+		return nil
+	}
+	return h.cmd.Process.Kill()
 }
 
-func (h *driverHandle) readProtocolEvents(r io.Reader) {
+func (h *driverHandle) readLines(r io.Reader, dst chan string) {
+	defer close(dst)
 	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 	for scanner.Scan() {
-		line := scanner.Bytes()
-		var ev rt.ProtocolEvent
-		if err := json.Unmarshal(line, &ev); err != nil {
-			h.errors <- fmt.Errorf("parsing adapter event: %w", err)
-			continue
-		}
-		h.events <- ev
-	}
-	if err := scanner.Err(); err != nil {
-		h.errors <- fmt.Errorf("reading adapter stdout: %w", err)
-	}
-	close(h.events)
-}
-
-func (h *driverHandle) readLines(r io.Reader, out chan<- string) {
-	scanner := bufio.NewScanner(r)
-	for scanner.Scan() {
-		out <- scanner.Text()
-	}
-	close(out)
-	if err := scanner.Err(); err != nil {
-		h.errors <- fmt.Errorf("reading process stream: %w", err)
+		dst <- scanner.Text()
 	}
 }
 
 func (h *driverHandle) wait() {
 	err := h.cmd.Wait()
-	close(h.errors)
 	h.done <- err
 	close(h.done)
 }
 
-func buildStageEnv(spec *rt.StageSpec, specPath string, def loader.AgentDef) []string {
-	childCommand := ""
-	childArgsJSON := "[]"
-	if def.Runtime.ChildCLI != nil {
-		childCommand = def.Runtime.ChildCLI.Command
-		childArgsJSON = mustMarshalStringSlice(def.Runtime.ChildCLI.Args)
+type cliEnvelope struct {
+	Outcome     string                   `json:"outcome"`
+	Message     string                   `json:"message,omitempty"`
+	Summary     string                   `json:"summary,omitempty"`
+	NextAgentID string                   `json:"next_agent_id,omitempty"`
+	Reason      string                   `json:"reason,omitempty"`
+	RequestID   string                   `json:"request_id,omitempty"`
+	Questions   []clarification.Question `json:"questions,omitempty"`
+	ContextRefs []string                 `json:"context_refs,omitempty"`
+	Findings    []rt.ReviewFinding       `json:"findings,omitempty"`
+}
+
+type baseDriver struct {
+	name loader.AgentDriver
+}
+
+func (d *baseDriver) supportsStage(stage rt.StageType) bool {
+	switch stage {
+	case rt.StageTypeExecute, rt.StageTypeClarify, rt.StageTypeValidateFix, rt.StageTypeReview:
+		return true
+	default:
+		return false
+	}
+}
+
+func (d *baseDriver) buildFallbackPrompt(basePrompt string, stageType rt.StageType) string {
+	return strings.TrimSpace(basePrompt) + "\n\n" + strings.TrimSpace(fmt.Sprintf(`
+Return your final machine-readable stage result as a JSON object wrapped between these exact markers:
+%s
+{ ... }
+%s
+
+Rules:
+- The JSON object must be the final thing you output inside the markers.
+- Do not wrap the JSON in markdown fences.
+- Keep all human explanation outside the markers.
+
+For %s stage use this schema:
+- Common fields: outcome, message.
+- outcome for execution-like stages: completed, clarification_requested, handoff_requested, failed.
+- outcome for review stage: completed or failed.
+- summary: optional human summary text.
+- next_agent_id: required only for handoff_requested.
+- reason, request_id, questions, context_refs: only for clarification_requested.
+- findings: only for review stage, as an array of review findings.
+`, resultBeginMarker, resultEndMarker, stageType))
+}
+
+func (d *baseDriver) parseEnvelopeFromText(text string) (*cliEnvelope, error) {
+	payload, err := extractResultEnvelope(text)
+	if err != nil {
+		return nil, err
+	}
+	var env cliEnvelope
+	if err := json.Unmarshal(payload, &env); err != nil {
+		return nil, fmt.Errorf("parsing structured CLI result: %w", err)
+	}
+	if env.Outcome == "" {
+		return nil, fmt.Errorf("structured CLI result is missing outcome")
+	}
+	return &env, nil
+}
+
+func (d *baseDriver) parsedOutputFromEnvelope(stageType rt.StageType, env *cliEnvelope) *ParsedStageOutput {
+	out := &ParsedStageOutput{
+		Result: rt.StageResult{
+			Outcome:     env.Outcome,
+			Message:     env.Message,
+			NextAgentID: env.NextAgentID,
+		},
+		Summary: env.Summary,
+	}
+	if env.Outcome == "clarification_requested" {
+		out.Clarification = &ParsedClarification{
+			RequestID:   env.RequestID,
+			Reason:      env.Reason,
+			Questions:   env.Questions,
+			ContextRefs: env.ContextRefs,
+		}
+	}
+	if stageType == rt.StageTypeReview {
+		out.ReviewReport = &rt.ReviewReport{
+			Summary:  env.Summary,
+			Findings: env.Findings,
+		}
+	}
+	return out
+}
+
+type claudeDriver struct{ baseDriver }
+type codexDriver struct{ baseDriver }
+type qwenDriver struct{ baseDriver }
+
+func newClaudeDriver() AgentCLIDriver {
+	return &claudeDriver{baseDriver{name: loader.AgentDriverClaude}}
+}
+func newCodexDriver() AgentCLIDriver { return &codexDriver{baseDriver{name: loader.AgentDriverCodex}} }
+func newQwenDriver() AgentCLIDriver  { return &qwenDriver{baseDriver{name: loader.AgentDriverQwen}} }
+
+func (d *claudeDriver) Name() loader.AgentDriver { return d.name }
+func (d *codexDriver) Name() loader.AgentDriver  { return d.name }
+func (d *qwenDriver) Name() loader.AgentDriver   { return d.name }
+
+func (d *claudeDriver) SupportsStage(stage rt.StageType) bool { return d.supportsStage(stage) }
+func (d *codexDriver) SupportsStage(stage rt.StageType) bool  { return d.supportsStage(stage) }
+func (d *qwenDriver) SupportsStage(stage rt.StageType) bool   { return d.supportsStage(stage) }
+
+func (d *claudeDriver) BuildStagePrompt(basePrompt string, spec *rt.StageSpec, session *rt.RunSession) (string, error) {
+	return d.buildFallbackPrompt(basePrompt, spec.Type), nil
+}
+
+func (d *codexDriver) BuildStagePrompt(basePrompt string, spec *rt.StageSpec, session *rt.RunSession) (string, error) {
+	return d.buildFallbackPrompt(basePrompt, spec.Type), nil
+}
+
+func (d *qwenDriver) BuildStagePrompt(basePrompt string, spec *rt.StageSpec, session *rt.RunSession) (string, error) {
+	return d.buildFallbackPrompt(basePrompt, spec.Type), nil
+}
+
+func (d *claudeDriver) BuildInvocation(profile loader.AgentDef, spec *rt.StageSpec, session *rt.RunSession, prompt string) (*CLIInvocation, error) {
+	args := append([]string{}, profile.Args...)
+	args = append(args, "-p", prompt)
+	return &CLIInvocation{Command: profile.Command, Args: args}, nil
+}
+
+func (d *codexDriver) BuildInvocation(profile loader.AgentDef, spec *rt.StageSpec, session *rt.RunSession, prompt string) (*CLIInvocation, error) {
+	args := append([]string{}, profile.Args...)
+	args = append(args, "-q", prompt)
+	return &CLIInvocation{Command: profile.Command, Args: args}, nil
+}
+
+func (d *qwenDriver) BuildInvocation(profile loader.AgentDef, spec *rt.StageSpec, session *rt.RunSession, prompt string) (*CLIInvocation, error) {
+	args := append([]string{}, profile.Args...)
+	if session.DriverState.ExternalSessionID != "" {
+		args = append(args, "--resume", session.DriverState.ExternalSessionID)
+	} else if len(session.StageHistory) > 0 {
+		args = append(args, "--continue")
+	}
+	args = append(args, "-p", prompt, "--output-format", "json")
+	return &CLIInvocation{
+		Command:           profile.Command,
+		Args:              args,
+		StructuredLogName: "qwen.response.json",
+	}, nil
+}
+
+func (d *claudeDriver) ParseStageOutput(spec *rt.StageSpec, capture *StageCapture) (*ParsedStageOutput, error) {
+	env, err := d.parseEnvelopeFromText(capture.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	return d.parsedOutputFromEnvelope(spec.Type, env), nil
+}
+
+func (d *codexDriver) ParseStageOutput(spec *rt.StageSpec, capture *StageCapture) (*ParsedStageOutput, error) {
+	env, err := d.parseEnvelopeFromText(capture.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	return d.parsedOutputFromEnvelope(spec.Type, env), nil
+}
+
+func (d *qwenDriver) ParseStageOutput(spec *rt.StageSpec, capture *StageCapture) (*ParsedStageOutput, error) {
+	text, sessionID, structuredLogName, structuredLog, err := parseQwenStructuredOutput(capture.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	env, err := d.parseEnvelopeFromText(text)
+	if err != nil {
+		return nil, err
+	}
+	out := d.parsedOutputFromEnvelope(spec.Type, env)
+	out.ExternalSessionID = sessionID
+	out.StructuredLogName = structuredLogName
+	out.StructuredLog = structuredLog
+	return out, nil
+}
+
+func parseQwenStructuredOutput(stdout string) (text string, sessionID string, logName string, log []byte, err error) {
+	trimmed := strings.TrimSpace(stdout)
+	if trimmed == "" {
+		return "", "", "", nil, fmt.Errorf("qwen produced empty stdout")
 	}
 
-	return []string{
-		"AGENTCTL_STAGE_SPEC=" + specPath,
-		"AGENTCTL_SESSION_DIR=" + spec.SessionDir,
-		"AGENTCTL_STAGE_DIR=" + spec.StageDir,
+	if strings.HasPrefix(trimmed, "[") {
+		text, sessionID, err = parseQwenJSONArray(trimmed)
+		if err != nil {
+			return "", "", "", nil, err
+		}
+		return text, sessionID, "qwen.response.json", []byte(trimmed), nil
+	}
+
+	if strings.HasPrefix(trimmed, "{") {
+		text, sessionID, err = parseQwenJSONLines(trimmed)
+		if err == nil {
+			return text, sessionID, "qwen.response.jsonl", []byte(trimmed), nil
+		}
+	}
+
+	return stdout, "", "", nil, nil
+}
+
+func parseQwenJSONArray(data string) (string, string, error) {
+	var items []map[string]any
+	if err := json.Unmarshal([]byte(data), &items); err != nil {
+		return "", "", fmt.Errorf("parsing qwen json output: %w", err)
+	}
+	return collectQwenText(items)
+}
+
+func parseQwenJSONLines(data string) (string, string, error) {
+	lines := strings.Split(data, "\n")
+	items := make([]map[string]any, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var item map[string]any
+		if err := json.Unmarshal([]byte(line), &item); err != nil {
+			return "", "", fmt.Errorf("parsing qwen stream-json output: %w", err)
+		}
+		items = append(items, item)
+	}
+	return collectQwenText(items)
+}
+
+func collectQwenText(items []map[string]any) (string, string, error) {
+	var parts []string
+	sessionID := ""
+	for _, item := range items {
+		if sessionID == "" {
+			if s, _ := item["session_id"].(string); s != "" {
+				sessionID = s
+			}
+		}
+		switch item["type"] {
+		case "assistant":
+			msg, _ := item["message"].(map[string]any)
+			content, _ := msg["content"].([]any)
+			for _, block := range content {
+				blockMap, _ := block.(map[string]any)
+				if blockMap["type"] == "text" {
+					if text, _ := blockMap["text"].(string); text != "" {
+						parts = append(parts, text)
+					}
+				}
+			}
+		case "result":
+			if text, _ := item["result"].(string); text != "" {
+				parts = append(parts, text)
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return "", sessionID, fmt.Errorf("qwen output did not contain assistant or result text")
+	}
+	return strings.Join(parts, "\n"), sessionID, nil
+}
+
+func extractResultEnvelope(text string) ([]byte, error) {
+	start := strings.Index(text, resultBeginMarker)
+	end := strings.Index(text, resultEndMarker)
+	if start >= 0 && end > start {
+		payload := strings.TrimSpace(text[start+len(resultBeginMarker) : end])
+		if payload == "" {
+			return nil, fmt.Errorf("empty structured result payload")
+		}
+		return []byte(payload), nil
+	}
+
+	trimmed := strings.TrimSpace(text)
+	if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
+		return []byte(trimmed), nil
+	}
+	return nil, fmt.Errorf("structured CLI result markers not found")
+}
+
+func buildStageEnv(spec *rt.StageSpec, profile loader.AgentDef) []string {
+	env := []string{
 		"AGENTCTL_TASK_ID=" + spec.TaskID,
+		"AGENTCTL_RUN_ID=" + spec.RunID,
 		"AGENTCTL_SESSION_ID=" + spec.SessionID,
 		"AGENTCTL_STAGE_ID=" + spec.StageID,
+		"AGENTCTL_STAGE_TYPE=" + string(spec.Type),
 		"AGENTCTL_AGENT_ID=" + spec.AgentID,
+		"AGENTCTL_WORK_DIR=" + spec.WorkDir,
+		"AGENTCTL_SESSION_DIR=" + spec.SessionDir,
+		"AGENTCTL_STAGE_DIR=" + spec.StageDir,
 		"AGENTCTL_TASK_PATH=" + spec.TaskPath,
 		"AGENTCTL_CONTEXT_DIR=" + spec.ContextDir,
 		"AGENTCTL_PROMPT_PATH=" + spec.PromptPath,
-		"AGENTCTL_CHILD_CLI_COMMAND=" + childCommand,
-		"AGENTCTL_CHILD_CLI_ARGS_JSON=" + childArgsJSON,
 	}
-}
-
-func rawPromptArg(spec *rt.StageSpec, specPath string) (string, error) {
-	if spec.PromptPath != "" {
-		data, err := os.ReadFile(spec.PromptPath)
-		if err != nil {
-			return "", fmt.Errorf("reading prompt for raw cli: %w", err)
-		}
-		return strings.TrimSpace(string(data)), nil
+	for key, value := range profile.Env {
+		env = append(env, key+"="+value)
 	}
-	return specPath, nil
-}
-
-func mustMarshalStringSlice(values []string) string {
-	data, err := json.Marshal(values)
-	if err != nil {
-		return "[]"
-	}
-	return string(data)
-}
-
-func nextSequence(current int64) int64 {
-	return current + 1
-}
-
-func intPtr(n int) *int {
-	return &n
-}
-
-func atoiOrZero(value string) int {
-	n, _ := strconv.Atoi(value)
-	return n
+	return env
 }

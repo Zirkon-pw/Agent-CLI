@@ -100,52 +100,6 @@ func (s *RunStore) LoadArtifactManifest(taskID, sessionID string) (*rt.ArtifactM
 	return &manifest, nil
 }
 
-// AppendProtocolEvent appends an adapter protocol event to the raw protocol log.
-func (s *RunStore) AppendProtocolEvent(taskID, sessionID string, ev *rt.ProtocolEvent) error {
-	data, err := json.Marshal(ev)
-	if err != nil {
-		return fmt.Errorf("marshaling protocol event: %w", err)
-	}
-	dir := s.RunDir(taskID, sessionID)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("creating session dir: %w", err)
-	}
-	f, err := os.OpenFile(filepath.Join(dir, "protocol.ndjson"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("opening protocol log: %w", err)
-	}
-	defer f.Close()
-	if _, err := f.Write(append(data, '\n')); err != nil {
-		return fmt.Errorf("appending protocol event: %w", err)
-	}
-	return nil
-}
-
-// ReadProtocolEvents replays the persisted protocol log for a session.
-func (s *RunStore) ReadProtocolEvents(taskID, sessionID string) ([]rt.ProtocolEvent, error) {
-	data, err := os.ReadFile(filepath.Join(s.RunDir(taskID, sessionID), "protocol.ndjson"))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	lines := splitLines(data)
-	events := make([]rt.ProtocolEvent, 0, len(lines))
-	for _, line := range lines {
-		if len(line) == 0 {
-			continue
-		}
-		var ev rt.ProtocolEvent
-		if err := json.Unmarshal(line, &ev); err != nil {
-			return nil, fmt.Errorf("parsing protocol event: %w", err)
-		}
-		events = append(events, ev)
-	}
-	return events, nil
-}
-
 func sessionToRunSummary(session *rt.RunSession) *run.Run {
 	summary := &run.Run{
 		ID:        session.ID,
@@ -163,7 +117,7 @@ func sessionToRunSummary(session *rt.RunSession) *run.Run {
 		summary.Status = run.RunStatusSuccess
 	} else {
 		switch session.Status {
-		case rt.SessionStatusQueued, rt.SessionStatusStageRunning, rt.SessionStatusWaitingClarification, rt.SessionStatusPaused, rt.SessionStatusHandoffPending:
+		case rt.SessionStatusQueued, rt.SessionStatusStageRunning, rt.SessionStatusWaitingClarification, rt.SessionStatusHandoffPending:
 			summary.Status = run.RunStatusRunning
 		case rt.SessionStatusCompleted, rt.SessionStatusReviewing:
 			summary.Status = run.RunStatusSuccess

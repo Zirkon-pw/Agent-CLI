@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/docup/agentctl/internal/config/loader"
@@ -24,7 +26,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// TaskSupervisor runs stage-based task sessions using structured adapter protocols.
+// TaskSupervisor runs stage-based task sessions using built-in CLI drivers.
 type TaskSupervisor struct {
 	taskStore      *fsstore.TaskStore
 	runStore       *fsstore.RunStore
@@ -114,7 +116,6 @@ func (s *TaskSupervisor) Run(ctx context.Context, t *task.Task) (*rt.RunSession,
 		}
 
 		if session.Status == rt.SessionStatusWaitingClarification ||
-			session.Status == rt.SessionStatusPaused ||
 			session.Status == rt.SessionStatusCanceled ||
 			session.Status == rt.SessionStatusHandoffPending ||
 			session.Status == rt.SessionStatusReviewing ||
@@ -196,9 +197,9 @@ func (s *TaskSupervisor) nextStageType(t *task.Task, session *rt.RunSession) (rt
 		if t.Clarifications.PendingRequest != nil {
 			return "", nil
 		}
-		return rt.StageTypeExecute, nil
+		return rt.StageTypeClarify, nil
 	}
-	if session.Status == rt.SessionStatusPaused || session.Status == rt.SessionStatusCanceled ||
+	if session.Status == rt.SessionStatusCanceled ||
 		session.Status == rt.SessionStatusCompleted || session.Status == rt.SessionStatusFailed {
 		return "", nil
 	}
@@ -212,7 +213,7 @@ func (s *TaskSupervisor) nextStageType(t *task.Task, session *rt.RunSession) (rt
 	if last.Type == rt.StageTypeReview && last.State == rt.StageStateCompleted {
 		return "", nil
 	}
-	if last.State == rt.StageStateCompleted && (last.Type == rt.StageTypeExecute || last.Type == rt.StageTypeValidateFix) {
+	if last.State == rt.StageStateCompleted && (last.Type == rt.StageTypeExecute || last.Type == rt.StageTypeClarify || last.Type == rt.StageTypeValidateFix) {
 		return rt.StageTypeReview, nil
 	}
 	return rt.StageTypeExecute, nil
@@ -240,6 +241,20 @@ func (s *TaskSupervisor) prepareStageSpec(t *task.Task, session *rt.RunSession, 
 			return nil, err
 		}
 		promptPath = filepath.Join(stageDir, "prompt.md")
+		if err := os.WriteFile(promptPath, []byte(promptContent), 0644); err != nil {
+			return nil, err
+		}
+	case rt.StageTypeClarify:
+		var err error
+		contextDir, err = s.contextBuilder.Build(t)
+		if err != nil {
+			return nil, err
+		}
+		promptContent, err := s.promptBuilder.BuildPrompt(t, contextDir, stageDir)
+		if err != nil {
+			return nil, err
+		}
+		promptPath = filepath.Join(stageDir, "clarification_prompt.md")
 		if err := os.WriteFile(promptPath, []byte(promptContent), 0644); err != nil {
 			return nil, err
 		}
@@ -275,19 +290,18 @@ func (s *TaskSupervisor) prepareStageSpec(t *task.Task, session *rt.RunSession, 
 	}
 
 	spec := &rt.StageSpec{
-		ProtocolVersion: "v1",
-		SessionID:       session.ID,
-		TaskID:          t.ID,
-		RunID:           session.ID,
-		StageID:         stageID,
-		Type:            stageType,
-		AgentID:         session.CurrentAgentID,
-		WorkDir:         s.projectRoot,
-		SessionDir:      s.runStore.RunDir(t.ID, session.ID),
-		StageDir:        stageDir,
-		TaskPath:        taskPath,
-		ContextDir:      contextDir,
-		PromptPath:      promptPath,
+		SessionID:  session.ID,
+		TaskID:     t.ID,
+		RunID:      session.ID,
+		StageID:    stageID,
+		Type:       stageType,
+		AgentID:    session.CurrentAgentID,
+		WorkDir:    s.projectRoot,
+		SessionDir: s.runStore.RunDir(t.ID, session.ID),
+		StageDir:   stageDir,
+		TaskPath:   taskPath,
+		ContextDir: contextDir,
+		PromptPath: promptPath,
 		Input: rt.StageInput{
 			Task:             t,
 			ArtifactManifest: session.ArtifactManifest,
@@ -352,31 +366,55 @@ func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, sess
 		return err
 	}
 
-	driver, err := s.drivers.Get(spec.AgentID)
+	profile, driver, err := s.drivers.Resolve(spec.AgentID)
 	if err != nil {
 		return s.failStage(t, session, current, runtimeErrLog, err, false)
+	}
+	if !profile.IsEnabled() {
+		return s.failStage(t, session, current, runtimeErrLog, fmt.Errorf("agent %s is disabled", spec.AgentID), false)
 	}
 	if err := s.validateDriver(driver, spec.Type); err != nil {
 		return s.failStage(t, session, current, runtimeErrLog, err, true)
 	}
 
-	stdoutLog, stderrLog, err := s.ensureStageIOArtifacts(t.ID, session, spec, driver.Kind())
+	basePrompt := ""
+	if spec.PromptPath != "" {
+		data, err := os.ReadFile(spec.PromptPath)
+		if err != nil {
+			return s.failStage(t, session, current, runtimeErrLog, fmt.Errorf("reading base prompt: %w", err), false)
+		}
+		basePrompt = string(data)
+	}
+	finalPrompt, err := driver.BuildStagePrompt(basePrompt, spec, session)
+	if err != nil {
+		return s.failStage(t, session, current, runtimeErrLog, err, false)
+	}
+	if spec.PromptPath == "" {
+		spec.PromptPath = filepath.Join(spec.StageDir, "prompt.md")
+	}
+	if err := os.WriteFile(spec.PromptPath, []byte(finalPrompt), 0644); err != nil {
+		return s.failStage(t, session, current, runtimeErrLog, fmt.Errorf("writing driver prompt: %w", err), false)
+	}
+
+	stdoutLog, stderrLog, err := s.ensureStageIOArtifacts(t.ID, session, spec)
 	if err != nil {
 		return s.failStage(t, session, current, runtimeErrLog, err, false)
 	}
 
-	specPath := filepath.Join(spec.StageDir, "stage_spec.json")
-	handle, err := driver.Start(ctx, spec, specPath)
+	invocation, err := driver.BuildInvocation(profile, spec, session, finalPrompt)
 	if err != nil {
 		return s.failStage(t, session, current, runtimeErrLog, err, false)
 	}
-	eventsCh := handle.Events()
+
+	handle, err := StartCLIProcess(ctx, spec, invocation, profile)
+	if err != nil {
+		return s.failStage(t, session, current, runtimeErrLog, err, false)
+	}
+
 	stdoutCh := handle.Stdout()
 	stderrCh := handle.Stderr()
-	errorsCh := handle.Errors()
 	doneCh := handle.Done()
 
-	session.Capabilities = driver.Capabilities()
 	session.Recovery.AdapterPID = handle.PID()
 	session.Recovery.ProcessGroupID = handle.ProcessGroupID()
 	session.Recovery.LastHeartbeatAt = now
@@ -396,7 +434,6 @@ func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, sess
 		ProcessGroupID: handle.ProcessGroupID(),
 		StartedAt:      now,
 		UpdatedAt:      now,
-		Capabilities:   driver.Capabilities(),
 	}
 	if err := s.registry.RegisterRun(active); err != nil {
 		return err
@@ -409,67 +446,35 @@ func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, sess
 	ticker := time.NewTicker(time.Duration(t.Runtime.HeartbeatIntervalSec) * time.Second)
 	defer ticker.Stop()
 
-	var gracefulDeadline *time.Time
-	stageCompleted := false
 	processExited := false
 	var processErr error
-	protocolStage := driver.Kind() == loader.AgentRuntimeKindProtocolAdapter
+	var stdoutBuf strings.Builder
+	var stderrBuf strings.Builder
 
-	for !stageCompleted {
+	for !(processExited && stdoutCh == nil && stderrCh == nil) {
 		select {
 		case <-ctx.Done():
 			_ = handle.Kill()
 			return s.failStage(t, session, current, runtimeErrLog, ctx.Err(), false)
 
-		case ev, ok := <-eventsCh:
-			if !ok {
-				eventsCh = nil
-				if protocolStage && processExited && current.Result == nil {
-					return s.failStage(t, session, current, runtimeErrLog, protocolExitError(processErr), false)
-				}
-				if !protocolStage && processExited && stdoutCh == nil && stderrCh == nil && current.Result == nil {
-					s.applyRawProcessResult(session, current, t, processErr)
-					stageCompleted = true
-				}
-				continue
-			}
-			if err := s.handleProtocolEvent(t, session, current, spec, &ev); err != nil {
-				return s.failStage(t, session, current, runtimeErrLog, err, false)
-			}
-			if ev.Type == rt.EventTypeStageCompleted {
-				stageCompleted = true
-			}
-
 		case line, ok := <-stdoutCh:
 			if ok && line != "" && stdoutLog != "" {
+				stdoutBuf.WriteString(line)
+				stdoutBuf.WriteByte('\n')
 				_ = appendFile(stdoutLog, line+"\n")
 			}
 			if !ok {
 				stdoutCh = nil
-				if !protocolStage && processExited && stderrCh == nil && current.Result == nil {
-					s.applyRawProcessResult(session, current, t, processErr)
-					stageCompleted = true
-				}
 			}
 
 		case line, ok := <-stderrCh:
 			if ok && line != "" && stderrLog != "" {
+				stderrBuf.WriteString(line)
+				stderrBuf.WriteByte('\n')
 				_ = appendFile(stderrLog, line+"\n")
 			}
 			if !ok {
 				stderrCh = nil
-				if !protocolStage && processExited && stdoutCh == nil && current.Result == nil {
-					s.applyRawProcessResult(session, current, t, processErr)
-					stageCompleted = true
-				}
-			}
-
-		case err, ok := <-errorsCh:
-			if ok && err != nil {
-				return s.failStage(t, session, current, runtimeErrLog, err, false)
-			}
-			if !ok {
-				errorsCh = nil
 			}
 
 		case err, ok := <-doneCh:
@@ -480,299 +485,86 @@ func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, sess
 			processExited = true
 			processErr = err
 			doneCh = nil
-			if protocolStage && eventsCh == nil && current.Result == nil {
-				return s.failStage(t, session, current, runtimeErrLog, protocolExitError(err), false)
-			}
-			if !protocolStage && eventsCh == nil && stdoutCh == nil && stderrCh == nil && current.Result == nil {
-				s.applyRawProcessResult(session, current, t, err)
-				stageCompleted = true
-			}
 
 		case <-ticker.C:
 			now := time.Now()
 			session.Recovery.LastHeartbeatAt = now
 			_ = s.heartbeatMgr.Write(t.ID, session.ID)
-
-			commands, err := s.registry.CommandsAfter(t.ID, session.LastCommandSeq)
-			if err != nil {
-				return err
-			}
-			for _, cmd := range commands {
-				session.LastCommandSeq = cmd.Seq
-				session.PendingControlCommand = &cmd
-				session.UpdatedAt = time.Now()
-				if err := s.persistSession(t, session); err != nil {
-					return err
-				}
-				if err := handle.Send(cmd); err != nil {
-					return s.failStage(t, session, current, runtimeErrLog, err, false)
-				}
-				switch cmd.Type {
-				case rt.CommandTypePause:
-					session.Status = rt.SessionStatusPaused
-					t.Status = task.StatusPaused
-					t.UpdatedAt = time.Now()
-				case rt.CommandTypeCancel:
-					deadline := time.Now().Add(time.Duration(t.Runtime.GracefulStopTimeoutSec) * time.Second)
-					gracefulDeadline = &deadline
-				case rt.CommandTypeResume:
-					session.Status = rt.SessionStatusStageRunning
-					t.Status = task.StatusStageRunning
-					t.UpdatedAt = time.Now()
-				case rt.CommandTypeKill:
-					_ = handle.Kill()
-					session.Status = rt.SessionStatusCanceled
-					t.Status = task.StatusCanceled
-					t.UpdatedAt = time.Now()
-					stageCompleted = true
-				}
-			}
-			if gracefulDeadline != nil && time.Now().After(*gracefulDeadline) {
-				_ = handle.Kill()
-				session.Status = rt.SessionStatusCanceled
-				t.Status = task.StatusCanceled
-				t.UpdatedAt = time.Now()
-				stageCompleted = true
-			}
+			active.UpdatedAt = now
+			_ = s.registry.UpdateRun(active)
 		}
 	}
 
 	finished := time.Now()
 	current.FinishedAt = &finished
-	session.PendingControlCommand = nil
 	session.CurrentStageID = ""
 	session.UpdatedAt = finished
-	if session.Status == rt.SessionStatusStageRunning {
-		session.Status = rt.SessionStatusQueued
-	}
-	return s.persistSession(t, session)
-}
 
-func (s *TaskSupervisor) handleProtocolEvent(
-	t *task.Task,
-	session *rt.RunSession,
-	stage *rt.StageRun,
-	spec *rt.StageSpec,
-	ev *rt.ProtocolEvent,
-) error {
-	if ev.SessionID == "" {
-		ev.SessionID = session.ID
+	if terminatedBySignal(processErr, syscall.SIGTERM) || terminatedBySignal(processErr, syscall.SIGKILL) {
+		current.State = rt.StageStateCanceled
+		current.Result = &rt.StageResult{Outcome: "canceled", Message: "process terminated by control signal"}
+		session.Status = rt.SessionStatusCanceled
+		t.Status = task.StatusCanceled
+		t.UpdatedAt = finished
+		_ = s.writeStageResultArtifact(t.ID, session, spec.StageID, current.Result)
+		s.eventSink.Emit(t.ID, session.ID, "stage_completed", "canceled")
+		return s.persistSession(t, session)
 	}
-	if ev.TaskID == "" {
-		ev.TaskID = t.ID
-	}
-	if ev.RunID == "" {
-		ev.RunID = session.ID
-	}
-	if ev.StageID == "" {
-		ev.StageID = spec.StageID
-	}
-	if ev.Timestamp.IsZero() {
-		ev.Timestamp = time.Now()
-	}
-	if err := s.runStore.AppendProtocolEvent(t.ID, session.ID, ev); err != nil {
-		return err
+	if processErr != nil {
+		return s.failStage(t, session, current, runtimeErrLog, stageProcessError(processErr), false)
 	}
 
-	if ev.Seq > session.LastEventSeq {
-		session.LastEventSeq = ev.Seq
+	parsed, err := driver.ParseStageOutput(spec, &StageCapture{
+		Stdout:     stdoutBuf.String(),
+		Stderr:     stderrBuf.String(),
+		ProcessErr: processErr,
+	})
+	if err != nil {
+		return s.failStage(t, session, current, runtimeErrLog, err, false)
 	}
-	session.Recovery.LastHeartbeatAt = time.Now()
+	if parsed.ExternalSessionID != "" {
+		session.DriverState.ExternalSessionID = parsed.ExternalSessionID
+	}
+	if err := s.materializeParsedOutput(t, session, spec, parsed); err != nil {
+		return s.failStage(t, session, current, runtimeErrLog, err, false)
+	}
 
-	switch ev.Type {
-	case rt.EventTypeHello:
-		var payload rt.HelloPayload
-		if err := json.Unmarshal(ev.Payload, &payload); err == nil {
-			session.Capabilities = intersectCapabilities(session.Capabilities, payload.Capabilities)
+	current.Result = &parsed.Result
+	switch parsed.Result.Outcome {
+	case "completed":
+		current.State = rt.StageStateCompleted
+		if spec.Type == rt.StageTypeReview {
+			session.Status = rt.SessionStatusReviewing
+			t.Status = task.StatusReviewing
+		} else {
+			session.Status = rt.SessionStatusQueued
 		}
-	case rt.EventTypeProgress:
-		var payload rt.ProgressPayload
-		if err := json.Unmarshal(ev.Payload, &payload); err == nil {
-			s.eventSink.Emit(t.ID, session.ID, "progress", payload.Message)
-		}
-	case rt.EventTypeHeartbeat:
-		_ = s.heartbeatMgr.Write(t.ID, session.ID)
-	case rt.EventTypeArtifact:
-		var payload rt.ArtifactPayload
-		if err := json.Unmarshal(ev.Payload, &payload); err != nil {
-			return err
-		}
-		absPath := payload.Path
-		if !filepath.IsAbs(absPath) {
-			absPath = filepath.Join(spec.StageDir, payload.Path)
-		}
-		record := rt.ArtifactRecord{
-			Name:      payload.Name,
-			Kind:      payload.Kind,
-			Path:      absPath,
-			StageID:   spec.StageID,
-			MediaType: payload.MediaType,
-			CreatedAt: time.Now(),
-		}
-		session.ArtifactManifest.Add(record)
-		if err := s.runStore.SaveArtifactManifest(t.ID, session.ID, &session.ArtifactManifest); err != nil {
-			return err
-		}
-		if err := s.materializeSessionArtifact(t.ID, session.ID, record); err != nil {
-			return err
-		}
-	case rt.EventTypeClarificationRequested:
-		var payload rt.ClarificationRequestedPayload
-		if err := json.Unmarshal(ev.Payload, &payload); err != nil {
-			return err
-		}
-		reqID := payload.RequestID
-		if reqID == "" {
-			reqID = fmt.Sprintf("CLAR-REQ-%03d", len(t.Clarifications.Attached)+1)
-		}
-		req := &clarification.Request{
-			TaskID:      t.ID,
-			RequestID:   reqID,
-			CreatedBy:   spec.AgentID,
-			Reason:      payload.Reason,
-			Questions:   payload.Questions,
-			ContextRefs: payload.ContextRefs,
-			CreatedAt:   time.Now(),
-		}
-		path, err := s.clarStore.SaveRequest(req)
-		if err != nil {
-			return err
-		}
-		t.SetPendingClarification(reqID)
-		t.Status = task.StatusWaitingClarification
-		t.UpdatedAt = time.Now()
-		session.PendingClarificationID = &reqID
+	case "clarification_requested":
+		current.State = rt.StageStateCompleted
 		session.Status = rt.SessionStatusWaitingClarification
-		session.ArtifactManifest.Add(rt.ArtifactRecord{
-			Name:      filepath.Base(path),
-			Kind:      "clarification_request",
-			Path:      path,
-			StageID:   spec.StageID,
-			MediaType: "application/yaml",
-			CreatedAt: time.Now(),
-		})
-		_ = s.runStore.SaveArtifactManifest(t.ID, session.ID, &session.ArtifactManifest)
-		s.eventSink.Emit(t.ID, session.ID, "waiting_clarification", reqID)
-	case rt.EventTypeReviewReport:
-		var payload rt.ReviewReportPayload
-		if err := json.Unmarshal(ev.Payload, &payload); err != nil {
-			return err
-		}
-		report := &rt.ReviewReport{
-			StageID:      spec.StageID,
-			Summary:      payload.Summary,
-			Findings:     payload.Findings,
-			ArtifactPath: payload.ArtifactPath,
-			CreatedAt:    time.Now(),
-		}
-		session.ReviewReport = report
-		data, _ := json.MarshalIndent(report, "", "  ")
-		if err := s.runStore.WriteArtifact(t.ID, session.ID, "review_report.json", data); err == nil {
-			session.ArtifactManifest.Add(rt.ArtifactRecord{
-				Name:      "review_report.json",
-				Kind:      "review_report",
-				Path:      filepath.Join(s.runStore.RunDir(t.ID, session.ID), "review_report.json"),
-				StageID:   spec.StageID,
-				MediaType: "application/json",
-				CreatedAt: time.Now(),
-			})
-			_ = s.runStore.SaveArtifactManifest(t.ID, session.ID, &session.ArtifactManifest)
-		}
-	case rt.EventTypeHandoffRequested:
-		var payload rt.HandoffRequestedPayload
-		if err := json.Unmarshal(ev.Payload, &payload); err != nil {
-			return err
-		}
-		session.PendingHandoff = &rt.PendingHandoff{
-			NextAgentID: payload.NextAgentID,
-			Reason:      payload.Reason,
-			RequestedAt: time.Now(),
-		}
+		t.Status = task.StatusWaitingClarification
+	case "handoff_requested", "handoff_pending":
+		current.State = rt.StageStateCompleted
 		session.Status = rt.SessionStatusHandoffPending
 		t.Status = task.StatusHandoffPending
-		t.UpdatedAt = time.Now()
-		s.eventSink.Emit(t.ID, session.ID, "handoff_pending", payload.NextAgentID)
-	case rt.EventTypeWarning:
-		var payload rt.ErrorPayload
-		if err := json.Unmarshal(ev.Payload, &payload); err == nil {
-			s.eventSink.Emit(t.ID, session.ID, "warning", payload.Message)
+		session.PendingHandoff = &rt.PendingHandoff{
+			NextAgentID: parsed.Result.NextAgentID,
+			RequestedAt: time.Now(),
 		}
-	case rt.EventTypeError:
-		var payload rt.ErrorPayload
-		if err := json.Unmarshal(ev.Payload, &payload); err == nil {
-			s.eventSink.Emit(t.ID, session.ID, "error", payload.Message)
-		}
-	case rt.EventTypeStageCompleted:
-		var payload rt.StageCompletedPayload
-		if err := json.Unmarshal(ev.Payload, &payload); err != nil {
-			return err
-		}
-		stage.Result = &payload.Result
-		switch payload.Result.Outcome {
-		case "completed":
-			stage.State = rt.StageStateCompleted
-			session.Status = rt.SessionStatusQueued
-		case "clarification_requested":
-			stage.State = rt.StageStateCompleted
-			session.Status = rt.SessionStatusWaitingClarification
-			t.Status = task.StatusWaitingClarification
-		case "handoff_requested", "handoff_pending":
-			stage.State = rt.StageStateCompleted
-			session.Status = rt.SessionStatusHandoffPending
-			t.Status = task.StatusHandoffPending
-			if payload.Result.NextAgentID != "" && session.PendingHandoff == nil {
-				session.PendingHandoff = &rt.PendingHandoff{
-					NextAgentID: payload.Result.NextAgentID,
-					RequestedAt: time.Now(),
-				}
-			}
-		case "paused":
-			stage.State = rt.StageStatePaused
-			session.Status = rt.SessionStatusPaused
-			t.Status = task.StatusPaused
-		case "canceled":
-			stage.State = rt.StageStateCanceled
-			session.Status = rt.SessionStatusCanceled
-			t.Status = task.StatusCanceled
-		default:
-			stage.State = rt.StageStateFailed
-			session.Status = rt.SessionStatusFailed
-			t.Status = task.StatusFailed
-		}
-		if payload.Result.ReviewPath != "" {
-			session.ArtifactManifest.Add(rt.ArtifactRecord{
-				Name:      filepath.Base(payload.Result.ReviewPath),
-				Kind:      "review_report",
-				Path:      payload.Result.ReviewPath,
-				StageID:   spec.StageID,
-				MediaType: "application/json",
-				CreatedAt: time.Now(),
-			})
-		}
-		if payload.Result.SummaryPath != "" {
-			session.ArtifactManifest.Add(rt.ArtifactRecord{
-				Name:      filepath.Base(payload.Result.SummaryPath),
-				Kind:      "summary",
-				Path:      payload.Result.SummaryPath,
-				StageID:   spec.StageID,
-				MediaType: "text/markdown",
-				CreatedAt: time.Now(),
-			})
-		}
-		if payload.Result.DiffPath != "" {
-			session.ArtifactManifest.Add(rt.ArtifactRecord{
-				Name:      filepath.Base(payload.Result.DiffPath),
-				Kind:      "diff",
-				Path:      payload.Result.DiffPath,
-				StageID:   spec.StageID,
-				MediaType: "text/x-diff",
-				CreatedAt: time.Now(),
-			})
-		}
-		_ = s.runStore.SaveArtifactManifest(t.ID, session.ID, &session.ArtifactManifest)
-		s.eventSink.Emit(t.ID, session.ID, "stage_completed", payload.Result.Outcome)
+	case "canceled":
+		current.State = rt.StageStateCanceled
+		session.Status = rt.SessionStatusCanceled
+		t.Status = task.StatusCanceled
+	default:
+		current.State = rt.StageStateFailed
+		session.Status = rt.SessionStatusFailed
+		t.Status = task.StatusFailed
 	}
-
+	t.UpdatedAt = finished
+	if err := s.writeStageResultArtifact(t.ID, session, spec.StageID, current.Result); err != nil {
+		return s.failStage(t, session, current, runtimeErrLog, err, false)
+	}
+	s.eventSink.Emit(t.ID, session.ID, "stage_completed", parsed.Result.Outcome)
 	return s.persistSession(t, session)
 }
 
@@ -903,64 +695,31 @@ func (s *TaskSupervisor) ensureRuntimeErrorArtifact(taskID string, session *rt.R
 	return path, nil
 }
 
-func (s *TaskSupervisor) ensureStageIOArtifacts(taskID string, session *rt.RunSession, spec *rt.StageSpec, kind loader.AgentRuntimeKind) (string, string, error) {
-	var stdoutLog string
-	var stderrLog string
-
-	switch kind {
-	case loader.AgentRuntimeKindProtocolAdapter:
-		protocolPath := filepath.Join(s.runStore.RunDir(taskID, session.ID), "protocol.ndjson")
-		if err := touchFile(protocolPath); err != nil {
-			return "", "", err
-		}
-		session.ArtifactManifest.Add(rt.ArtifactRecord{
-			Name:      "protocol.ndjson",
-			Kind:      "protocol_log",
-			Path:      protocolPath,
-			MediaType: "application/x-ndjson",
-			CreatedAt: time.Now(),
-		})
-		stderrLog = filepath.Join(spec.StageDir, "adapter.stderr.log")
-		if err := touchFile(stderrLog); err != nil {
-			return "", "", err
-		}
-		session.ArtifactManifest.Add(rt.ArtifactRecord{
-			Name:      "adapter.stderr.log",
-			Kind:      "stderr_log",
-			Path:      stderrLog,
-			StageID:   spec.StageID,
-			MediaType: "text/plain",
-			CreatedAt: time.Now(),
-		})
-	case loader.AgentRuntimeKindRawCLI:
-		stdoutLog = filepath.Join(spec.StageDir, "raw.stdout.log")
-		stderrLog = filepath.Join(spec.StageDir, "raw.stderr.log")
-		if err := touchFile(stdoutLog); err != nil {
-			return "", "", err
-		}
-		if err := touchFile(stderrLog); err != nil {
-			return "", "", err
-		}
-		session.ArtifactManifest.Add(rt.ArtifactRecord{
-			Name:      "raw.stdout.log",
-			Kind:      "stdout_log",
-			Path:      stdoutLog,
-			StageID:   spec.StageID,
-			MediaType: "text/plain",
-			CreatedAt: time.Now(),
-		})
-		session.ArtifactManifest.Add(rt.ArtifactRecord{
-			Name:      "raw.stderr.log",
-			Kind:      "stderr_log",
-			Path:      stderrLog,
-			StageID:   spec.StageID,
-			MediaType: "text/plain",
-			CreatedAt: time.Now(),
-		})
-	default:
-		return "", "", fmt.Errorf("unsupported runtime kind %q", kind)
+func (s *TaskSupervisor) ensureStageIOArtifacts(taskID string, session *rt.RunSession, spec *rt.StageSpec) (string, string, error) {
+	stdoutLog := filepath.Join(spec.StageDir, "stdout.log")
+	stderrLog := filepath.Join(spec.StageDir, "stderr.log")
+	if err := touchFile(stdoutLog); err != nil {
+		return "", "", err
 	}
-
+	if err := touchFile(stderrLog); err != nil {
+		return "", "", err
+	}
+	session.ArtifactManifest.Add(rt.ArtifactRecord{
+		Name:      "stdout.log",
+		Kind:      "stdout_log",
+		Path:      stdoutLog,
+		StageID:   spec.StageID,
+		MediaType: "text/plain",
+		CreatedAt: time.Now(),
+	})
+	session.ArtifactManifest.Add(rt.ArtifactRecord{
+		Name:      "stderr.log",
+		Kind:      "stderr_log",
+		Path:      stderrLog,
+		StageID:   spec.StageID,
+		MediaType: "text/plain",
+		CreatedAt: time.Now(),
+	})
 	if err := s.runStore.SaveArtifactManifest(taskID, session.ID, &session.ArtifactManifest); err != nil {
 		return "", "", err
 	}
@@ -987,7 +746,6 @@ func (s *TaskSupervisor) failStage(
 	stage.FinishedAt = &now
 	session.Status = rt.SessionStatusFailed
 	session.CurrentStageID = ""
-	session.PendingControlCommand = nil
 	session.UpdatedAt = now
 	if blockStage {
 		session.BlockedStageType = stage.Type
@@ -997,41 +755,9 @@ func (s *TaskSupervisor) failStage(
 	return s.persistSession(t, session)
 }
 
-func (s *TaskSupervisor) applyRawProcessResult(session *rt.RunSession, stage *rt.StageRun, t *task.Task, processErr error) {
-	if processErr == nil {
-		stage.State = rt.StageStateCompleted
-		stage.Result = &rt.StageResult{Outcome: "completed"}
-		session.Status = rt.SessionStatusQueued
-		return
-	}
-
-	stage.State = rt.StageStateFailed
-	stage.Result = rawProcessResult(processErr)
-	session.Status = rt.SessionStatusFailed
-	t.Status = task.StatusFailed
-	t.UpdatedAt = time.Now()
-}
-
-func (s *TaskSupervisor) validateDriver(driver AgentRuntimeDriver, stageType rt.StageType) error {
+func (s *TaskSupervisor) validateDriver(driver AgentCLIDriver, stageType rt.StageType) error {
 	if !driver.SupportsStage(stageType) {
-		switch driver.Kind() {
-		case loader.AgentRuntimeKindRawCLI:
-			return fmt.Errorf("agent %s uses raw_cli runtime and does not support %s stage; route the task to a protocol-capable agent", driver.ID(), stageType)
-		default:
-			return fmt.Errorf("agent %s does not support %s stage", driver.ID(), stageType)
-		}
-	}
-
-	cap := driver.Capabilities()
-	switch stageType {
-	case rt.StageTypeReview:
-		if !cap.SupportsReview {
-			return fmt.Errorf("adapter does not support review stages")
-		}
-	case rt.StageTypeExecute, rt.StageTypeValidateFix:
-		if !cap.SupportsKill {
-			return fmt.Errorf("adapter must support kill control commands")
-		}
+		return fmt.Errorf("driver %s does not support %s stage", driver.Name(), stageType)
 	}
 	return nil
 }
@@ -1046,44 +772,14 @@ func (s *TaskSupervisor) stageAttempt(session *rt.RunSession, stageType rt.Stage
 	return attempt + 1
 }
 
-func (s *TaskSupervisor) materializeSessionArtifact(taskID, sessionID string, artifact rt.ArtifactRecord) error {
-	base := filepath.Base(artifact.Path)
-	if base == artifact.Name {
-		return nil
-	}
-	if artifact.Name == "" {
-		return nil
-	}
-	data, err := os.ReadFile(artifact.Path)
-	if err != nil {
-		return nil
-	}
-	return s.runStore.WriteArtifact(taskID, sessionID, artifact.Name, data)
-}
-
-func rawProcessResult(processErr error) *rt.StageResult {
+func stageProcessError(processErr error) error {
 	if processErr == nil {
-		return &rt.StageResult{Outcome: "completed"}
-	}
-	result := &rt.StageResult{
-		Outcome: "failed",
-		Message: processErr.Error(),
+		return nil
 	}
 	if exitCode, ok := processExitCode(processErr); ok {
-		result.ExitCode = intPtr(exitCode)
-		result.Message = fmt.Sprintf("raw cli exited with code %d", exitCode)
+		return fmt.Errorf("cli exited with code %d", exitCode)
 	}
-	return result
-}
-
-func protocolExitError(processErr error) error {
-	if processErr == nil {
-		return fmt.Errorf("protocol adapter exited before emitting stage_completed")
-	}
-	if exitCode, ok := processExitCode(processErr); ok {
-		return fmt.Errorf("protocol adapter exited with code %d before emitting stage_completed", exitCode)
-	}
-	return fmt.Errorf("protocol adapter exited before emitting stage_completed: %w", processErr)
+	return fmt.Errorf("cli process failed: %w", processErr)
 }
 
 func processExitCode(err error) (int, bool) {
@@ -1206,18 +902,201 @@ func touchFile(path string) error {
 	return f.Close()
 }
 
-func intersectCapabilities(configured, reported rt.AdapterCapabilities) rt.AdapterCapabilities {
-	result := configured
-	if reported.ProtocolVersion != "" {
-		result.ProtocolVersion = reported.ProtocolVersion
+func terminatedBySignal(err error, sig syscall.Signal) bool {
+	if err == nil {
+		return false
 	}
-	result.SupportsCancel = configured.SupportsCancel && reported.SupportsCancel
-	result.SupportsPause = configured.SupportsPause && reported.SupportsPause
-	result.SupportsResume = configured.SupportsResume && reported.SupportsResume
-	result.SupportsKill = configured.SupportsKill && reported.SupportsKill
-	result.SupportsHeartbeat = configured.SupportsHeartbeat && reported.SupportsHeartbeat
-	result.SupportsClarification = configured.SupportsClarification && reported.SupportsClarification
-	result.SupportsReview = configured.SupportsReview && reported.SupportsReview
-	result.SupportsHandoff = configured.SupportsHandoff && reported.SupportsHandoff
-	return result
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+	status, ok := exitErr.Sys().(syscall.WaitStatus)
+	return ok && status.Signaled() && status.Signal() == sig
+}
+
+func (s *TaskSupervisor) materializeParsedOutput(
+	t *task.Task,
+	session *rt.RunSession,
+	spec *rt.StageSpec,
+	parsed *ParsedStageOutput,
+) error {
+	now := time.Now()
+
+	if parsed.StructuredLogName != "" && len(parsed.StructuredLog) > 0 {
+		path := filepath.Join(spec.StageDir, parsed.StructuredLogName)
+		if err := os.WriteFile(path, parsed.StructuredLog, 0644); err != nil {
+			return err
+		}
+		s.addArtifact(session, rt.ArtifactRecord{
+			Name:      parsed.StructuredLogName,
+			Kind:      "structured_log",
+			Path:      path,
+			StageID:   spec.StageID,
+			MediaType: "application/json",
+			CreatedAt: now,
+		})
+	}
+
+	if parsed.Summary != "" {
+		if err := s.runStore.WriteArtifact(t.ID, session.ID, "summary.md", []byte(parsed.Summary)); err != nil {
+			return err
+		}
+		parsed.Result.SummaryPath = filepath.Join(s.runStore.RunDir(t.ID, session.ID), "summary.md")
+		s.addArtifact(session, rt.ArtifactRecord{
+			Name:      "summary.md",
+			Kind:      "summary",
+			Path:      parsed.Result.SummaryPath,
+			StageID:   spec.StageID,
+			MediaType: "text/markdown",
+			CreatedAt: now,
+		})
+	}
+
+	if spec.Type == rt.StageTypeExecute || spec.Type == rt.StageTypeClarify || spec.Type == rt.StageTypeValidateFix {
+		diffPath, changedFilesPath, err := s.captureWorkspaceDiffArtifacts(t.ID, session.ID)
+		if err != nil {
+			return err
+		}
+		if diffPath != "" {
+			parsed.Result.DiffPath = diffPath
+			s.addArtifact(session, rt.ArtifactRecord{
+				Name:      "diff.patch",
+				Kind:      "diff",
+				Path:      diffPath,
+				StageID:   spec.StageID,
+				MediaType: "text/x-diff",
+				CreatedAt: now,
+			})
+		}
+		if changedFilesPath != "" {
+			s.addArtifact(session, rt.ArtifactRecord{
+				Name:      "changed_files.json",
+				Kind:      "changed_files",
+				Path:      changedFilesPath,
+				StageID:   spec.StageID,
+				MediaType: "application/json",
+				CreatedAt: now,
+			})
+		}
+	}
+
+	if parsed.ReviewReport != nil {
+		parsed.ReviewReport.StageID = spec.StageID
+		parsed.ReviewReport.CreatedAt = now
+		data, err := json.MarshalIndent(parsed.ReviewReport, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := s.runStore.WriteArtifact(t.ID, session.ID, "review_report.json", data); err != nil {
+			return err
+		}
+		path := filepath.Join(s.runStore.RunDir(t.ID, session.ID), "review_report.json")
+		parsed.Result.ReviewPath = path
+		parsed.ReviewReport.ArtifactPath = path
+		session.ReviewReport = parsed.ReviewReport
+		s.addArtifact(session, rt.ArtifactRecord{
+			Name:      "review_report.json",
+			Kind:      "review_report",
+			Path:      path,
+			StageID:   spec.StageID,
+			MediaType: "application/json",
+			CreatedAt: now,
+		})
+	}
+
+	if parsed.Clarification != nil {
+		reqID := parsed.Clarification.RequestID
+		if reqID == "" {
+			reqID = fmt.Sprintf("CLAR-REQ-%03d", len(t.Clarifications.Attached)+1)
+		}
+		req := &clarification.Request{
+			TaskID:      t.ID,
+			RequestID:   reqID,
+			CreatedBy:   spec.AgentID,
+			Reason:      parsed.Clarification.Reason,
+			Questions:   parsed.Clarification.Questions,
+			ContextRefs: parsed.Clarification.ContextRefs,
+			CreatedAt:   now,
+		}
+		path, err := s.clarStore.SaveRequest(req)
+		if err != nil {
+			return err
+		}
+		t.SetPendingClarification(reqID)
+		session.PendingClarificationID = &reqID
+		s.addArtifact(session, rt.ArtifactRecord{
+			Name:      filepath.Base(path),
+			Kind:      "clarification_request",
+			Path:      path,
+			StageID:   spec.StageID,
+			MediaType: "application/yaml",
+			CreatedAt: now,
+		})
+	}
+
+	if err := s.runStore.SaveArtifactManifest(t.ID, session.ID, &session.ArtifactManifest); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *TaskSupervisor) captureWorkspaceDiffArtifacts(taskID, sessionID string) (string, string, error) {
+	if _, err := os.Stat(filepath.Join(s.projectRoot, ".git")); err != nil {
+		return "", "", nil
+	}
+
+	diffCmd := exec.Command("git", "-C", s.projectRoot, "diff", "--no-ext-diff", "--binary")
+	diffOut, diffErr := diffCmd.Output()
+	if diffErr != nil {
+		return "", "", nil
+	}
+	diffPath := ""
+	if len(diffOut) > 0 {
+		if err := s.runStore.WriteArtifact(taskID, sessionID, "diff.patch", diffOut); err != nil {
+			return "", "", err
+		}
+		diffPath = filepath.Join(s.runStore.RunDir(taskID, sessionID), "diff.patch")
+	}
+
+	filesCmd := exec.Command("git", "-C", s.projectRoot, "diff", "--name-only")
+	filesOut, filesErr := filesCmd.Output()
+	if filesErr != nil {
+		return diffPath, "", nil
+	}
+	trimmed := strings.TrimSpace(string(filesOut))
+	if trimmed == "" {
+		return diffPath, "", nil
+	}
+	fileNames := strings.Split(trimmed, "\n")
+	data, err := json.MarshalIndent(fileNames, "", "  ")
+	if err != nil {
+		return diffPath, "", err
+	}
+	if err := s.runStore.WriteArtifact(taskID, sessionID, "changed_files.json", data); err != nil {
+		return diffPath, "", err
+	}
+	return diffPath, filepath.Join(s.runStore.RunDir(taskID, sessionID), "changed_files.json"), nil
+}
+
+func (s *TaskSupervisor) writeStageResultArtifact(taskID string, session *rt.RunSession, stageID string, result *rt.StageResult) error {
+	if result == nil {
+		return nil
+	}
+	path := filepath.Join(s.runStore.StageDir(taskID, session.ID, stageID), "stage_result.json")
+	if err := writeJSON(path, result); err != nil {
+		return err
+	}
+	s.addArtifact(session, rt.ArtifactRecord{
+		Name:      "stage_result.json",
+		Kind:      "stage_result",
+		Path:      path,
+		StageID:   stageID,
+		MediaType: "application/json",
+		CreatedAt: time.Now(),
+	})
+	return s.runStore.SaveArtifactManifest(taskID, session.ID, &session.ArtifactManifest)
+}
+
+func (s *TaskSupervisor) addArtifact(session *rt.RunSession, item rt.ArtifactRecord) {
+	session.ArtifactManifest.Add(item)
 }

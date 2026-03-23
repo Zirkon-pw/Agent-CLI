@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 
-	rt "github.com/docup/agentctl/internal/core/runtime"
 	"gopkg.in/yaml.v3"
 )
 
@@ -62,105 +61,26 @@ type ArtifactsCfg struct {
 	ReviewsDir string `yaml:"reviews_dir"`
 }
 
-type AgentRuntimeKind string
+type AgentDriver string
 
 const (
-	AgentRuntimeKindProtocolAdapter AgentRuntimeKind = "protocol_adapter"
-	AgentRuntimeKindRawCLI          AgentRuntimeKind = "raw_cli"
+	AgentDriverClaude AgentDriver = "claude"
+	AgentDriverCodex  AgentDriver = "codex"
+	AgentDriverQwen   AgentDriver = "qwen"
 )
-
-// AgentMetadata contains descriptive, non-runtime agent metadata.
-type AgentMetadata struct {
-	Specialization []string `yaml:"specialization"`
-	Strengths      []string `yaml:"strengths"`
-	Speed          string   `yaml:"speed"`
-	Cost           string   `yaml:"cost"`
-	ContextLimit   string   `yaml:"context_limit"`
-	Modes          []string `yaml:"modes"`
-	Tools          []string `yaml:"tools"`
-}
-
-// AgentExec describes an executable command with arguments.
-type AgentExec struct {
-	Command string   `yaml:"command"`
-	Args    []string `yaml:"args"`
-}
-
-// AgentControl describes supported runtime controls.
-type AgentControl struct {
-	Cancel    bool `yaml:"cancel"`
-	Pause     bool `yaml:"pause"`
-	Resume    bool `yaml:"resume"`
-	Kill      bool `yaml:"kill"`
-	Heartbeat bool `yaml:"heartbeat"`
-}
-
-// AgentProtocol describes machine-readable protocol settings for wrappers.
-type AgentProtocol struct {
-	Version string `yaml:"version"`
-}
-
-// AgentRuntime defines how the agent is executed.
-type AgentRuntime struct {
-	Kind            AgentRuntimeKind `yaml:"kind"`
-	Exec            AgentExec        `yaml:"exec"`
-	SupportedStages []rt.StageType   `yaml:"supported_stages"`
-	Control         AgentControl     `yaml:"control"`
-	Protocol        *AgentProtocol   `yaml:"protocol,omitempty"`
-	ChildCLI        *AgentExec       `yaml:"child_cli,omitempty"`
-}
 
 // AgentDef describes an available agent from agents.yaml.
 type AgentDef struct {
-	ID       string        `yaml:"id"`
-	Role     string        `yaml:"role"`
-	Metadata AgentMetadata `yaml:"metadata"`
-	Runtime  AgentRuntime  `yaml:"runtime"`
+	ID      string            `yaml:"id"`
+	Driver  AgentDriver       `yaml:"driver"`
+	Command string            `yaml:"command"`
+	Args    []string          `yaml:"args,omitempty"`
+	Env     map[string]string `yaml:"env,omitempty"`
+	Enabled *bool             `yaml:"enabled,omitempty"`
 }
 
-// Capabilities derives runtime capabilities from the configured agent runtime.
-func (a AgentDef) Capabilities() rt.AdapterCapabilities {
-	supportsReview := false
-	supportsHandoff := false
-	for _, stage := range a.Runtime.SupportedStages {
-		if stage == rt.StageTypeReview {
-			supportsReview = true
-		}
-		if stage == rt.StageTypeHandoff {
-			supportsHandoff = true
-		}
-	}
-
-	protocolVersion := ""
-	supportsClarification := false
-	if a.Runtime.Kind == AgentRuntimeKindProtocolAdapter {
-		supportsClarification = true
-		if a.Runtime.Protocol != nil {
-			protocolVersion = a.Runtime.Protocol.Version
-		}
-	}
-
-	return rt.AdapterCapabilities{
-		ProtocolVersion:       protocolVersion,
-		SupportsCancel:        a.Runtime.Control.Cancel,
-		SupportsPause:         a.Runtime.Control.Pause,
-		SupportsResume:        a.Runtime.Control.Resume,
-		SupportsKill:          a.Runtime.Control.Kill,
-		SupportsHeartbeat:     a.Runtime.Control.Heartbeat,
-		SupportsClarification: supportsClarification,
-		SupportsReview:        supportsReview,
-		SupportsHandoff:       supportsHandoff,
-	}
-}
-
-// SupportsStage returns true if the agent is configured to handle the stage type.
-func (a AgentDef) SupportsStage(stage rt.StageType) bool {
-	for _, candidate := range a.Runtime.SupportedStages {
-		if candidate == stage {
-			return true
-		}
-	}
-	return false
+func (a AgentDef) IsEnabled() bool {
+	return a.Enabled == nil || *a.Enabled
 }
 
 // AgentsConfig wraps the list of agents.
@@ -280,74 +200,25 @@ func DefaultAgentsConfig() *AgentsConfig {
 	return &AgentsConfig{
 		Agents: []AgentDef{
 			{
-				ID:   "claude",
-				Role: "executor",
-				Metadata: AgentMetadata{
-					Specialization: []string{"architecture_refactor", "deep_analysis"},
-					Strengths:      []string{"large_context_reasoning", "architecture_review"},
-					Speed:          "medium",
-					Cost:           "high",
-					ContextLimit:   "large",
-					Modes:          []string{"strict", "research"},
-					Tools:          []string{"filesystem", "git"},
-				},
-				Runtime: AgentRuntime{
-					Kind:            AgentRuntimeKindProtocolAdapter,
-					Exec:            AgentExec{Command: "claude", Args: []string{"-p"}},
-					SupportedStages: []rt.StageType{rt.StageTypeExecute, rt.StageTypeValidateFix, rt.StageTypeReview, rt.StageTypeHandoff},
-					Control: AgentControl{
-						Cancel: true,
-						Kill:   true,
-					},
-					Protocol: &AgentProtocol{Version: "v1"},
-					ChildCLI: &AgentExec{Command: "claude", Args: []string{"-p"}},
-				},
+				ID:      "claude",
+				Driver:  AgentDriverClaude,
+				Command: "claude",
+				Args:    []string{},
+				Enabled: boolPtr(true),
 			},
 			{
-				ID:   "codex",
-				Role: "executor",
-				Metadata: AgentMetadata{
-					Specialization: []string{"code_generation", "task_execution"},
-					Strengths:      []string{"code_edits", "terminal_workflow"},
-					Speed:          "high",
-					Cost:           "medium",
-					ContextLimit:   "medium",
-					Modes:          []string{"strict", "fast"},
-					Tools:          []string{"filesystem", "terminal"},
-				},
-				Runtime: AgentRuntime{
-					Kind:            AgentRuntimeKindProtocolAdapter,
-					Exec:            AgentExec{Command: "codex", Args: []string{"-q"}},
-					SupportedStages: []rt.StageType{rt.StageTypeExecute, rt.StageTypeValidateFix, rt.StageTypeReview, rt.StageTypeHandoff},
-					Control: AgentControl{
-						Cancel: true,
-						Kill:   true,
-					},
-					Protocol: &AgentProtocol{Version: "v1"},
-					ChildCLI: &AgentExec{Command: "codex", Args: []string{"-q"}},
-				},
+				ID:      "codex",
+				Driver:  AgentDriverCodex,
+				Command: "codex",
+				Args:    []string{},
+				Enabled: boolPtr(true),
 			},
 			{
-				ID:   "qwen",
-				Role: "executor",
-				Metadata: AgentMetadata{
-					Specialization: []string{"bulk_tests", "code_generation"},
-					Strengths:      []string{"fast_generation", "code_edits"},
-					Speed:          "high",
-					Cost:           "low",
-					ContextLimit:   "medium",
-					Modes:          []string{"strict", "fast"},
-					Tools:          []string{"filesystem", "terminal"},
-				},
-				Runtime: AgentRuntime{
-					Kind:            AgentRuntimeKindRawCLI,
-					Exec:            AgentExec{Command: "qwen", Args: []string{}},
-					SupportedStages: []rt.StageType{rt.StageTypeExecute, rt.StageTypeValidateFix},
-					Control: AgentControl{
-						Cancel: true,
-						Kill:   true,
-					},
-				},
+				ID:      "qwen",
+				Driver:  AgentDriverQwen,
+				Command: "qwen",
+				Args:    []string{},
+				Enabled: boolPtr(true),
 			},
 		},
 	}
@@ -362,8 +233,9 @@ func validateAgentsConfigSchema(data []byte) error {
 	}
 
 	legacyFields := []string{
-		"command",
-		"args",
+		"role",
+		"metadata",
+		"runtime",
 		"transport",
 		"adapter_command",
 		"adapter_args",
@@ -383,36 +255,32 @@ func validateAgentsConfigSchema(data []byte) error {
 }
 
 func validateAgentsConfig(cfg AgentsConfig) error {
+	seen := make(map[string]struct{}, len(cfg.Agents))
 	for _, agent := range cfg.Agents {
 		if agent.ID == "" {
 			return fmt.Errorf("agent id is required")
 		}
-		if agent.Runtime.Kind == "" {
-			return fmt.Errorf("agent %q is missing runtime.kind", agent.ID)
+		if _, ok := seen[agent.ID]; ok {
+			return fmt.Errorf("duplicate agent id %q", agent.ID)
 		}
-		if agent.Runtime.Exec.Command == "" {
-			return fmt.Errorf("agent %q is missing runtime.exec.command", agent.ID)
+		seen[agent.ID] = struct{}{}
+		if agent.Driver == "" {
+			return fmt.Errorf("agent %q is missing driver", agent.ID)
 		}
-		if len(agent.Runtime.SupportedStages) == 0 {
-			return fmt.Errorf("agent %q must declare at least one runtime.supported_stages entry", agent.ID)
+		if agent.Command == "" {
+			return fmt.Errorf("agent %q is missing command", agent.ID)
 		}
-		switch agent.Runtime.Kind {
-		case AgentRuntimeKindProtocolAdapter:
-			if agent.Runtime.Protocol == nil || agent.Runtime.Protocol.Version == "" {
-				return fmt.Errorf("agent %q must declare runtime.protocol.version for protocol_adapter runtime", agent.ID)
-			}
-		case AgentRuntimeKindRawCLI:
-			if agent.Runtime.Protocol != nil {
-				return fmt.Errorf("agent %q cannot declare runtime.protocol for raw_cli runtime", agent.ID)
-			}
-			if agent.Runtime.ChildCLI != nil {
-				return fmt.Errorf("agent %q cannot declare runtime.child_cli for raw_cli runtime", agent.ID)
-			}
+		switch agent.Driver {
+		case AgentDriverClaude, AgentDriverCodex, AgentDriverQwen:
 		default:
-			return fmt.Errorf("agent %q uses unsupported runtime.kind %q", agent.ID, agent.Runtime.Kind)
+			return fmt.Errorf("agent %q uses unsupported driver %q", agent.ID, agent.Driver)
 		}
 	}
 	return nil
+}
+
+func boolPtr(v bool) *bool {
+	return &v
 }
 
 // DefaultRoutingConfig returns default routing rules.

@@ -74,11 +74,11 @@ func TestLoadAgentsConfig(t *testing.T) {
 	if loaded.Agents[0].ID != "claude" {
 		t.Errorf("first agent should be claude, got %s", loaded.Agents[0].ID)
 	}
-	if loaded.Agents[0].Runtime.Exec.Command != "claude" {
-		t.Errorf("claude exec command should be 'claude', got %s", loaded.Agents[0].Runtime.Exec.Command)
+	if loaded.Agents[0].Command != "claude" {
+		t.Errorf("claude command should be 'claude', got %s", loaded.Agents[0].Command)
 	}
-	if loaded.Agents[2].Runtime.Kind != AgentRuntimeKindRawCLI {
-		t.Errorf("qwen should default to raw_cli, got %s", loaded.Agents[2].Runtime.Kind)
+	if loaded.Agents[2].Driver != AgentDriverQwen {
+		t.Errorf("qwen should default to qwen driver, got %s", loaded.Agents[2].Driver)
 	}
 }
 
@@ -148,8 +148,8 @@ func TestDefaultAgentsConfig(t *testing.T) {
 	ids := map[string]bool{}
 	for _, a := range cfg.Agents {
 		ids[a.ID] = true
-		if a.Runtime.Exec.Command == "" {
-			t.Errorf("agent %s has empty runtime.exec.command", a.ID)
+		if a.Command == "" {
+			t.Errorf("agent %s has empty command", a.ID)
 		}
 	}
 	for _, expected := range []string{"claude", "codex", "qwen"} {

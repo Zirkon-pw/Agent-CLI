@@ -76,7 +76,7 @@ func (o *Orchestrator) Run(ctx context.Context, taskID string) error {
 	return err
 }
 
-// Stop sends a graceful cancel command to the live adapter session.
+// Stop sends SIGTERM to the live CLI process group.
 func (o *Orchestrator) Stop(taskID string) error {
 	active, err := o.registry.LoadActiveRun(taskID)
 	if err != nil {
@@ -85,19 +85,17 @@ func (o *Orchestrator) Stop(taskID string) error {
 	if active == nil {
 		return fmt.Errorf("task %s is not running", taskID)
 	}
-	if !active.Capabilities.SupportsCancel {
-		return fmt.Errorf("agent %s does not support cancel", active.Agent)
+	if active.ProcessGroupID > 0 {
+		if err := syscall.Kill(-active.ProcessGroupID, syscall.SIGTERM); err != nil {
+			return err
+		}
+	} else if active.PID > 0 {
+		if err := syscall.Kill(active.PID, syscall.SIGTERM); err != nil {
+			return err
+		}
 	}
 	o.eventSink.Emit(taskID, active.RunID, "cancel_requested", "")
-	return o.registry.AppendCommand(rt.ProtocolCommand{
-		SessionID: active.RunID,
-		TaskID:    taskID,
-		RunID:     active.RunID,
-		StageID:   active.StageID,
-		Seq:       time.Now().UnixNano(),
-		Timestamp: time.Now(),
-		Type:      rt.CommandTypeCancel,
-	})
+	return nil
 }
 
 // Kill force-kills a live adapter process group.
@@ -113,17 +111,10 @@ func (o *Orchestrator) Kill(taskID string) error {
 		if err := syscall.Kill(-active.ProcessGroupID, syscall.SIGKILL); err != nil {
 			return err
 		}
-	}
-	if err := o.registry.AppendCommand(rt.ProtocolCommand{
-		SessionID: active.RunID,
-		TaskID:    taskID,
-		RunID:     active.RunID,
-		StageID:   active.StageID,
-		Seq:       time.Now().UnixNano(),
-		Timestamp: time.Now(),
-		Type:      rt.CommandTypeKill,
-	}); err != nil {
-		return err
+	} else if active.PID > 0 {
+		if err := syscall.Kill(active.PID, syscall.SIGKILL); err != nil {
+			return err
+		}
 	}
 	t, err := o.taskStore.Load(taskID)
 	if err == nil {

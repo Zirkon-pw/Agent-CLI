@@ -6,24 +6,22 @@ import "time"
 type Signal string
 
 const (
-	SignalStop  Signal = "stop"
-	SignalKill  Signal = "kill"
-	SignalPause Signal = "pause"
+	SignalStop Signal = "stop"
+	SignalKill Signal = "kill"
 )
 
 // ActiveRun tracks a currently executing task run.
 type ActiveRun struct {
-	TaskID         string              `json:"task_id"`
-	RunID          string              `json:"run_id"`
-	SessionID      string              `json:"session_id,omitempty"`
-	StageID        string              `json:"stage_id,omitempty"`
-	Agent          string              `json:"agent"`
-	Status         SessionStatus       `json:"status,omitempty"`
-	PID            int                 `json:"pid"`
-	ProcessGroupID int                 `json:"process_group_id,omitempty"`
-	StartedAt      time.Time           `json:"started_at"`
-	UpdatedAt      time.Time           `json:"updated_at,omitempty"`
-	Capabilities   AdapterCapabilities `json:"capabilities,omitempty"`
+	TaskID         string        `json:"task_id"`
+	RunID          string        `json:"run_id"`
+	SessionID      string        `json:"session_id,omitempty"`
+	StageID        string        `json:"stage_id,omitempty"`
+	Agent          string        `json:"agent"`
+	Status         SessionStatus `json:"status,omitempty"`
+	PID            int           `json:"pid"`
+	ProcessGroupID int           `json:"process_group_id,omitempty"`
+	StartedAt      time.Time     `json:"started_at"`
+	UpdatedAt      time.Time     `json:"updated_at,omitempty"`
 }
 
 // Heartbeat holds the last heartbeat info for a running task.

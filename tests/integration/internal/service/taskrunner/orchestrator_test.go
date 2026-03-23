@@ -21,7 +21,7 @@ import (
 	"github.com/docup/agentctl/internal/service/prompting"
 )
 
-func setupOrchestrator(t *testing.T, script string) (*Orchestrator, *fsstore.TaskStore, *fsstore.RunStore, *infrart.Registry, string) {
+func setupOrchestrator(t *testing.T, driver loader.AgentDriver, script string) (*Orchestrator, *fsstore.TaskStore, *fsstore.RunStore, *infrart.Registry, string) {
 	t.Helper()
 	root := t.TempDir()
 	agentctlDir := filepath.Join(root, ".agentctl")
@@ -31,9 +31,9 @@ func setupOrchestrator(t *testing.T, script string) (*Orchestrator, *fsstore.Tas
 		}
 	}
 
-	adapterPath := filepath.Join(root, "fake-adapter.sh")
-	if err := os.WriteFile(adapterPath, []byte(script), 0755); err != nil {
-		t.Fatalf("write adapter: %v", err)
+	cliPath := filepath.Join(root, "fake-cli.sh")
+	if err := os.WriteFile(cliPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write cli: %v", err)
 	}
 
 	taskStore := fsstore.NewTaskStore(agentctlDir)
@@ -52,82 +52,20 @@ func setupOrchestrator(t *testing.T, script string) (*Orchestrator, *fsstore.Tas
 	drivers := NewAgentRuntimeRegistry(&loader.AgentsConfig{
 		Agents: []loader.AgentDef{
 			{
-				ID:   "fake",
-				Role: "executor",
-				Runtime: loader.AgentRuntime{
-					Kind:            loader.AgentRuntimeKindProtocolAdapter,
-					Exec:            loader.AgentExec{Command: adapterPath},
-					SupportedStages: []rt.StageType{rt.StageTypeExecute, rt.StageTypeValidateFix, rt.StageTypeReview, rt.StageTypeHandoff},
-					Control: loader.AgentControl{
-						Cancel:    true,
-						Kill:      true,
-						Heartbeat: true,
-					},
-					Protocol: &loader.AgentProtocol{Version: "v1"},
-				},
+				ID:      "fake",
+				Driver:  driver,
+				Command: cliPath,
+				Enabled: boolPtr(true),
 			},
 		},
 	})
+
 	supervisor := NewTaskSupervisor(
 		taskStore, runStore, clarStore, registry, heartbeatMgr, eventSink,
 		ctxBuilder, promptBuilder, cfg, drivers, root,
 	)
 	orch := NewOrchestrator(taskStore, runStore, registry, eventSink, cfg, supervisor)
 	return orch, taskStore, runStore, registry, agentctlDir
-}
-
-func setupRawCLIOrchestrator(t *testing.T, script string) (*Orchestrator, *fsstore.TaskStore, *fsstore.RunStore, string) {
-	t.Helper()
-	root := t.TempDir()
-	agentctlDir := filepath.Join(root, ".agentctl")
-	for _, d := range []string{"tasks", "runs", "runtime", "context", "templates/prompts", "guidelines", "clarifications"} {
-		if err := os.MkdirAll(filepath.Join(agentctlDir, d), 0755); err != nil {
-			t.Fatalf("mkdir %s: %v", d, err)
-		}
-	}
-
-	rawPath := filepath.Join(root, "fake-raw.sh")
-	if err := os.WriteFile(rawPath, []byte(script), 0755); err != nil {
-		t.Fatalf("write raw cli: %v", err)
-	}
-
-	taskStore := fsstore.NewTaskStore(agentctlDir)
-	runStore := fsstore.NewRunStore(agentctlDir)
-	clarStore := fsstore.NewClarificationStore(agentctlDir)
-	registry := infrart.NewRegistry(agentctlDir)
-	heartbeatMgr := infrart.NewHeartbeatManager(agentctlDir)
-	eventSink := events.NewSink(filepath.Join(agentctlDir, "runtime"))
-	ctxBuilder := contextpack.NewBuilder(agentctlDir, root)
-	templateStore := fsstore.NewTemplateStore(agentctlDir)
-	promptBuilder := prompting.NewBuilder(templateStore, agentctlDir)
-
-	cfg := loader.DefaultProjectConfig()
-	cfg.Execution.DefaultAgent = "raw"
-
-	drivers := NewAgentRuntimeRegistry(&loader.AgentsConfig{
-		Agents: []loader.AgentDef{
-			{
-				ID:   "raw",
-				Role: "executor",
-				Runtime: loader.AgentRuntime{
-					Kind:            loader.AgentRuntimeKindRawCLI,
-					Exec:            loader.AgentExec{Command: rawPath},
-					SupportedStages: []rt.StageType{rt.StageTypeExecute, rt.StageTypeValidateFix},
-					Control: loader.AgentControl{
-						Cancel: true,
-						Kill:   true,
-					},
-				},
-			},
-		},
-	})
-
-	supervisor := NewTaskSupervisor(
-		taskStore, runStore, clarStore, registry, heartbeatMgr, eventSink,
-		ctxBuilder, promptBuilder, cfg, drivers, root,
-	)
-	orch := NewOrchestrator(taskStore, runStore, registry, eventSink, cfg, supervisor)
-	return orch, taskStore, runStore, agentctlDir
 }
 
 func createDraftTask(store *fsstore.TaskStore) {
@@ -149,8 +87,8 @@ func createDraftTask(store *fsstore.TaskStore) {
 	})
 }
 
-func TestOrchestrator_Run_FullPipeline(t *testing.T) {
-	orch, store, runStore, _, _ := setupOrchestrator(t, fullPipelineAdapterScript())
+func TestOrchestrator_Run_FullPipelineWithClaudeDriver(t *testing.T) {
+	orch, store, runStore, _, _ := setupOrchestrator(t, loader.AgentDriverClaude, claudeWorkflowScript())
 	createDraftTask(store)
 
 	if err := orch.Run(context.Background(), "TASK-001"); err != nil {
@@ -172,68 +110,37 @@ func TestOrchestrator_Run_FullPipeline(t *testing.T) {
 	if len(session.StageHistory) != 2 {
 		t.Fatalf("expected execute + review stages, got %d", len(session.StageHistory))
 	}
-	if _, err := os.Stat(filepath.Join(runStore.RunDir("TASK-001", session.ID), "protocol.ndjson")); err != nil {
-		t.Fatalf("expected protocol log: %v", err)
+	if _, err := os.Stat(filepath.Join(runStore.StageDir("TASK-001", session.ID, "STAGE-001"), "stdout.log")); err != nil {
+		t.Fatalf("expected stdout log: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(runStore.StageDir("TASK-001", session.ID, "STAGE-002"), "stage_result.json")); err != nil {
+		t.Fatalf("expected stage_result.json: %v", err)
 	}
 }
 
-func TestOrchestrator_Run_RawCLIProducesLogsAndClearFailure(t *testing.T) {
-	orch, store, runStore, _ := setupRawCLIOrchestrator(t, rawCLIScript())
-
-	now := time.Now()
-	_ = store.Save(&task.Task{
-		ID:     "TASK-001",
-		Title:  "Raw execution",
-		Goal:   "Say hello",
-		Status: task.StatusDraft,
-		Agent:  "raw",
-		PromptTemplates: task.PromptTemplates{
-			Builtin: []string{"strict_executor"},
-		},
-		Clarifications: task.Clarifications{Attached: []string{}},
-		Runtime:        task.DefaultRuntimeConfig(),
-		Validation:     task.ValidationConfig{Mode: task.ValidationModeSimple, Commands: []string{}},
-		CreatedAt:      now,
-		UpdatedAt:      now,
-	})
+func TestOrchestrator_Run_QwenDriverPersistsStructuredLogAndContinuationState(t *testing.T) {
+	orch, store, runStore, _, _ := setupOrchestrator(t, loader.AgentDriverQwen, qwenWorkflowScript())
+	createDraftTask(store)
 
 	if err := orch.Run(context.Background(), "TASK-001"); err != nil {
 		t.Fatalf("run: %v", err)
-	}
-
-	tk, _ := store.Load("TASK-001")
-	if tk.Status != task.StatusFailed {
-		t.Fatalf("expected failed status after unsupported review stage, got %s", tk.Status)
 	}
 
 	session, err := runStore.LatestSession("TASK-001")
 	if err != nil {
 		t.Fatalf("latest session: %v", err)
 	}
-	if session.LastStage() == nil || session.LastStage().Type != rt.StageTypeReview {
-		t.Fatalf("expected blocked review stage, got %+v", session.LastStage())
+	if session.DriverState.ExternalSessionID != "qwen-session-1" {
+		t.Fatalf("expected qwen session id to be persisted, got %q", session.DriverState.ExternalSessionID)
 	}
-	if session.LastStage().Result == nil || session.LastStage().Result.Message == "" {
-		t.Fatalf("expected clear failure message for raw cli review stage")
-	}
-
-	stdoutPath := filepath.Join(runStore.StageDir("TASK-001", session.ID, "STAGE-001"), "raw.stdout.log")
-	stderrPath := filepath.Join(runStore.StageDir("TASK-001", session.ID, "STAGE-001"), "raw.stderr.log")
-	runtimeErrPath := filepath.Join(runStore.StageDir("TASK-001", session.ID, "STAGE-002"), "runtime_errors.log")
-
-	if data, err := os.ReadFile(stdoutPath); err != nil || len(data) == 0 {
-		t.Fatalf("expected raw stdout log, err=%v data=%q", err, data)
-	}
-	if data, err := os.ReadFile(stderrPath); err != nil || len(data) == 0 {
-		t.Fatalf("expected raw stderr log, err=%v data=%q", err, data)
-	}
-	if data, err := os.ReadFile(runtimeErrPath); err != nil || len(data) == 0 {
-		t.Fatalf("expected runtime error log for blocked review stage, err=%v data=%q", err, data)
+	structuredPath := filepath.Join(runStore.StageDir("TASK-001", session.ID, "STAGE-001"), "qwen.response.json")
+	if _, err := os.Stat(structuredPath); err != nil {
+		t.Fatalf("expected qwen structured log: %v", err)
 	}
 }
 
 func TestOrchestrator_Run_WithValidationFailure(t *testing.T) {
-	orch, store, _, _, _ := setupOrchestrator(t, fullPipelineAdapterScript())
+	orch, store, _, _, _ := setupOrchestrator(t, loader.AgentDriverClaude, claudeWorkflowScript())
 
 	now := time.Now()
 	_ = store.Save(&task.Task{
@@ -266,7 +173,7 @@ func TestOrchestrator_Run_WithValidationFailure(t *testing.T) {
 }
 
 func TestOrchestrator_Run_NormalizesAgentAndTemplate(t *testing.T) {
-	orch, store, _, _, _ := setupOrchestrator(t, fullPipelineAdapterScript())
+	orch, store, _, _, _ := setupOrchestrator(t, loader.AgentDriverClaude, claudeWorkflowScript())
 
 	now := time.Now()
 	_ = store.Save(&task.Task{
@@ -295,7 +202,7 @@ func TestOrchestrator_Run_NormalizesAgentAndTemplate(t *testing.T) {
 }
 
 func TestOrchestrator_Run_ClarificationFlow(t *testing.T) {
-	orch, store, runStore, _, agentctlDir := setupOrchestrator(t, clarificationAdapterScript())
+	orch, store, runStore, _, agentctlDir := setupOrchestrator(t, loader.AgentDriverClaude, clarificationWorkflowScript())
 	createDraftTask(store)
 
 	if err := orch.Run(context.Background(), "TASK-001"); err != nil {
@@ -325,7 +232,7 @@ func TestOrchestrator_Run_ClarificationFlow(t *testing.T) {
 }
 
 func TestOrchestrator_Run_RequiresTitleAndGoal(t *testing.T) {
-	orch, store, _, _, _ := setupOrchestrator(t, fullPipelineAdapterScript())
+	orch, store, _, _, _ := setupOrchestrator(t, loader.AgentDriverClaude, claudeWorkflowScript())
 
 	now := time.Now()
 	_ = store.Save(&task.Task{
@@ -345,15 +252,23 @@ func TestOrchestrator_Run_RequiresTitleAndGoal(t *testing.T) {
 }
 
 func TestOrchestrator_Run_TaskNotFound(t *testing.T) {
-	orch, _, _, _, _ := setupOrchestrator(t, fullPipelineAdapterScript())
+	orch, _, _, _, _ := setupOrchestrator(t, loader.AgentDriverClaude, claudeWorkflowScript())
 	if err := orch.Run(context.Background(), "NONEXISTENT"); err == nil {
 		t.Fatal("expected error for nonexistent task")
 	}
 }
 
-func TestOrchestrator_Stop_QueuesCancelCommand(t *testing.T) {
-	orch, store, _, registry, _ := setupOrchestrator(t, fullPipelineAdapterScript())
+func TestOrchestrator_Stop_SendsSIGTERMToProcessGroup(t *testing.T) {
+	orch, store, _, registry, _ := setupOrchestrator(t, loader.AgentDriverClaude, claudeWorkflowScript())
 
+	cmd := exec.Command("sh", "-c", "sleep 30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start sleep: %v", err)
+	}
+	defer func() { _ = cmd.Process.Kill() }()
+
+	pgid, _ := syscall.Getpgid(cmd.Process.Pid)
 	now := time.Now()
 	_ = store.Save(&task.Task{
 		ID:        "TASK-001",
@@ -364,15 +279,13 @@ func TestOrchestrator_Stop_QueuesCancelCommand(t *testing.T) {
 		UpdatedAt: now,
 	})
 	if err := registry.RegisterRun(rt.ActiveRun{
-		TaskID: "TASK-001",
-		RunID:  "RUN-001",
-		Agent:  "fake",
-		Status: rt.SessionStatusStageRunning,
-		Capabilities: rt.AdapterCapabilities{
-			SupportsCancel: true,
-			SupportsKill:   true,
-		},
-		StartedAt: now,
+		TaskID:         "TASK-001",
+		RunID:          "RUN-001",
+		Agent:          "fake",
+		Status:         rt.SessionStatusStageRunning,
+		PID:            cmd.Process.Pid,
+		ProcessGroupID: pgid,
+		StartedAt:      now,
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -380,17 +293,10 @@ func TestOrchestrator_Stop_QueuesCancelCommand(t *testing.T) {
 	if err := orch.Stop("TASK-001"); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
-	commands, err := registry.CommandsAfter("TASK-001", 0)
-	if err != nil {
-		t.Fatalf("commands: %v", err)
-	}
-	if len(commands) != 1 || commands[0].Type != rt.CommandTypeCancel {
-		t.Fatalf("expected one cancel command, got %+v", commands)
-	}
 }
 
 func TestOrchestrator_Kill_LiveProcess(t *testing.T) {
-	orch, store, _, registry, _ := setupOrchestrator(t, fullPipelineAdapterScript())
+	orch, store, _, registry, _ := setupOrchestrator(t, loader.AgentDriverClaude, claudeWorkflowScript())
 
 	cmd := exec.Command("sh", "-c", "sleep 30")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -416,7 +322,6 @@ func TestOrchestrator_Kill_LiveProcess(t *testing.T) {
 		Status:         rt.SessionStatusStageRunning,
 		PID:            cmd.Process.Pid,
 		ProcessGroupID: pgid,
-		Capabilities:   rt.AdapterCapabilities{SupportsKill: true},
 		StartedAt:      now,
 	}); err != nil {
 		t.Fatalf("register: %v", err)
@@ -428,7 +333,7 @@ func TestOrchestrator_Kill_LiveProcess(t *testing.T) {
 }
 
 func TestOrchestrator_Cancel(t *testing.T) {
-	orch, store, _, _, _ := setupOrchestrator(t, fullPipelineAdapterScript())
+	orch, store, _, _, _ := setupOrchestrator(t, loader.AgentDriverClaude, claudeWorkflowScript())
 
 	now := time.Now()
 	_ = store.Save(&task.Task{
@@ -449,7 +354,7 @@ func TestOrchestrator_Cancel(t *testing.T) {
 }
 
 func TestOrchestrator_Cancel_Running_Fails(t *testing.T) {
-	orch, store, _, registry, _ := setupOrchestrator(t, fullPipelineAdapterScript())
+	orch, store, _, registry, _ := setupOrchestrator(t, loader.AgentDriverClaude, claudeWorkflowScript())
 
 	now := time.Now()
 	_ = store.Save(&task.Task{
@@ -466,7 +371,7 @@ func TestOrchestrator_Cancel_Running_Fails(t *testing.T) {
 }
 
 func TestOrchestrator_AcceptRejectAndRoute(t *testing.T) {
-	orch, store, runStore, _, _ := setupOrchestrator(t, fullPipelineAdapterScript())
+	orch, store, runStore, _, _ := setupOrchestrator(t, loader.AgentDriverClaude, claudeWorkflowScript())
 
 	now := time.Now()
 	_ = store.Save(&task.Task{
@@ -519,50 +424,61 @@ func TestOrchestrator_AcceptRejectAndRoute(t *testing.T) {
 	}
 }
 
-func fullPipelineAdapterScript() string {
+func claudeWorkflowScript() string {
 	return `#!/bin/sh
-spec="$1"
-stage_type="execute"
-if grep -q '"type":[[:space:]]*"review"' "$spec"; then
-  stage_type="review"
-elif grep -q '"type":[[:space:]]*"validate_fix"' "$spec"; then
-  stage_type="validate_fix"
-fi
-emit() { printf '%s\n' "$1"; }
-base="{\"session_id\":\"$AGENTCTL_SESSION_ID\",\"task_id\":\"$AGENTCTL_TASK_ID\",\"run_id\":\"$AGENTCTL_SESSION_ID\",\"stage_id\":\"$AGENTCTL_STAGE_ID\",\"ts\":\"2026-03-22T00:00:00Z\""
-emit "${base},\"seq\":1,\"type\":\"hello\",\"payload\":{\"adapter_id\":\"fake\",\"capabilities\":{\"protocol_version\":\"v1\",\"supports_cancel\":true,\"supports_kill\":true,\"supports_heartbeat\":true,\"supports_clarification\":true,\"supports_review\":true,\"supports_handoff\":true}}}"
-emit "${base},\"seq\":2,\"type\":\"stage_started\",\"payload\":{\"type\":\"$stage_type\"}}"
-if [ "$stage_type" = "review" ]; then
-  printf '{"summary":"LGTM","findings":[]}\n' > "$AGENTCTL_SESSION_DIR/review_report.json"
-  emit "${base},\"seq\":3,\"type\":\"review_report\",\"payload\":{\"summary\":\"LGTM\",\"artifact_path\":\"$AGENTCTL_SESSION_DIR/review_report.json\"}}"
-  emit "${base},\"seq\":4,\"type\":\"stage_completed\",\"payload\":{\"result\":{\"outcome\":\"completed\",\"review_path\":\"$AGENTCTL_SESSION_DIR/review_report.json\"}}}"
+if [ "$AGENTCTL_STAGE_TYPE" = "review" ]; then
+cat <<'EOF'
+AGENTCTL_RESULT_BEGIN
+{"outcome":"completed","summary":"LGTM","findings":[]}
+AGENTCTL_RESULT_END
+EOF
 else
-  printf '# Summary\n' > "$AGENTCTL_SESSION_DIR/summary.md"
-  printf 'diff --git a/a b/a\n' > "$AGENTCTL_SESSION_DIR/diff.patch"
-  printf '[]\n' > "$AGENTCTL_SESSION_DIR/changed_files.json"
-  emit "${base},\"seq\":3,\"type\":\"artifact\",\"payload\":{\"name\":\"summary.md\",\"kind\":\"summary\",\"path\":\"$AGENTCTL_SESSION_DIR/summary.md\",\"media_type\":\"text/markdown\"}}"
-  emit "${base},\"seq\":4,\"type\":\"artifact\",\"payload\":{\"name\":\"diff.patch\",\"kind\":\"diff\",\"path\":\"$AGENTCTL_SESSION_DIR/diff.patch\",\"media_type\":\"text/x-diff\"}}"
-  emit "${base},\"seq\":5,\"type\":\"artifact\",\"payload\":{\"name\":\"changed_files.json\",\"kind\":\"changed_files\",\"path\":\"$AGENTCTL_SESSION_DIR/changed_files.json\",\"media_type\":\"application/json\"}}"
-  emit "${base},\"seq\":6,\"type\":\"stage_completed\",\"payload\":{\"result\":{\"outcome\":\"completed\",\"summary_path\":\"$AGENTCTL_SESSION_DIR/summary.md\",\"diff_path\":\"$AGENTCTL_SESSION_DIR/diff.patch\"}}}"
+cat <<'EOF'
+AGENTCTL_RESULT_BEGIN
+{"outcome":"completed","summary":"# Summary\nDone"}
+AGENTCTL_RESULT_END
+EOF
 fi
+printf 'driver stderr\n' >&2
 `
 }
 
-func clarificationAdapterScript() string {
+func qwenWorkflowScript() string {
 	return `#!/bin/sh
-emit() { printf '%s\n' "$1"; }
-base="{\"session_id\":\"$AGENTCTL_SESSION_ID\",\"task_id\":\"$AGENTCTL_TASK_ID\",\"run_id\":\"$AGENTCTL_SESSION_ID\",\"stage_id\":\"$AGENTCTL_STAGE_ID\",\"ts\":\"2026-03-22T00:00:00Z\""
-emit "${base},\"seq\":1,\"type\":\"hello\",\"payload\":{\"adapter_id\":\"fake\",\"capabilities\":{\"protocol_version\":\"v1\",\"supports_cancel\":true,\"supports_kill\":true,\"supports_heartbeat\":true,\"supports_clarification\":true,\"supports_review\":true,\"supports_handoff\":true}}}"
-emit "${base},\"seq\":2,\"type\":\"stage_started\",\"payload\":{\"type\":\"execute\"}}"
-emit "${base},\"seq\":3,\"type\":\"clarification_requested\",\"payload\":{\"request_id\":\"CLAR-REQ-001\",\"reason\":\"Need more input\",\"questions\":[{\"id\":\"q1\",\"text\":\"What edge case should be handled?\"}]}}"
-emit "${base},\"seq\":4,\"type\":\"stage_completed\",\"payload\":{\"result\":{\"outcome\":\"clarification_requested\"}}}"
+cat <<'EOF'
+[
+  {
+    "type":"system",
+    "session_id":"qwen-session-1"
+  },
+  {
+    "type":"assistant",
+    "session_id":"qwen-session-1",
+    "message":{
+      "content":[
+        {
+          "type":"text",
+          "text":"AGENTCTL_RESULT_BEGIN\n{\"outcome\":\"completed\",\"summary\":\"# Summary\\nDone from qwen\"}\nAGENTCTL_RESULT_END"
+        }
+      ]
+    }
+  },
+  {
+    "type":"result",
+    "session_id":"qwen-session-1",
+    "result":"AGENTCTL_RESULT_BEGIN\n{\"outcome\":\"completed\",\"summary\":\"# Summary\\nDone from qwen\"}\nAGENTCTL_RESULT_END"
+  }
+]
+EOF
 `
 }
 
-func rawCLIScript() string {
+func clarificationWorkflowScript() string {
 	return `#!/bin/sh
-printf 'hello from raw cli\n'
-printf 'warning from raw cli\n' >&2
-exit 0
+cat <<'EOF'
+AGENTCTL_RESULT_BEGIN
+{"outcome":"clarification_requested","reason":"Need more input","request_id":"CLAR-REQ-001","questions":[{"id":"q1","text":"What edge case should be handled?"}]}
+AGENTCTL_RESULT_END
+EOF
 `
 }
