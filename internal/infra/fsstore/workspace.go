@@ -61,8 +61,8 @@ func InitWorkspace(projectRoot string) (*Workspace, error) {
 		}
 	}
 
-	// Write default config.yaml
-	cfg := loader.DefaultProjectConfig()
+	// Write slim project-local config.yaml (only project section).
+	cfg := loader.DefaultProjectLocalConfig()
 	if err := writeYAML(filepath.Join(agentctlDir, "config.yaml"), cfg); err != nil {
 		return nil, fmt.Errorf("writing config.yaml: %w", err)
 	}

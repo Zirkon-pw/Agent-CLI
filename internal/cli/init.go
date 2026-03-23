@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 
+	"github.com/docup/agentctl/internal/config/global"
 	"github.com/docup/agentctl/internal/infra/fsstore"
 	"github.com/spf13/cobra"
 )
@@ -18,6 +19,12 @@ func NewInitCmd() *cobra.Command {
 			if dir == "" {
 				dir = "."
 			}
+			// Ensure global config exists.
+			globalDir, err := global.EnsureDir()
+			if err != nil {
+				return fmt.Errorf("init global config failed: %w", err)
+			}
+
 			ws, err := fsstore.InitWorkspace(dir)
 			if err != nil {
 				return fmt.Errorf("init failed: %w", err)
@@ -35,6 +42,7 @@ func NewInitCmd() *cobra.Command {
 			fmt.Println("  runs/          — execution artifacts")
 			fmt.Println("  runtime/       — live task state")
 			fmt.Println("  reviews/       — review decisions")
+			fmt.Printf("\nGlobal config: %s\n", globalDir)
 			return nil
 		},
 	}

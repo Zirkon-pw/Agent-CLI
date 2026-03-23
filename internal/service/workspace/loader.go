@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/docup/agentctl/internal/config/global"
 	"github.com/docup/agentctl/internal/config/loader"
 	"github.com/docup/agentctl/internal/infra/fsstore"
 )
@@ -18,32 +19,53 @@ type LoadedWorkspace struct {
 }
 
 // Load finds and loads the workspace from the given directory.
+// It loads global config first, then merges with project-local config.
 func Load(startDir string) (*LoadedWorkspace, error) {
+	// Ensure global config directory exists with defaults.
+	if _, err := global.EnsureDir(); err != nil {
+		return nil, fmt.Errorf("ensuring global config: %w", err)
+	}
+
+	// Load global configs.
+	globalCfg, err := global.LoadConfig()
+	if err != nil {
+		return nil, fmt.Errorf("loading global config: %w", err)
+	}
+	globalAgents, err := global.LoadAgents()
+	if err != nil {
+		return nil, fmt.Errorf("loading global agents: %w", err)
+	}
+	globalRouting, err := global.LoadRouting()
+	if err != nil {
+		return nil, fmt.Errorf("loading global routing: %w", err)
+	}
+
+	// Find project workspace.
 	ws, err := fsstore.FindWorkspace(startDir)
 	if err != nil {
 		return nil, err
 	}
 
-	cfg, err := loader.LoadProjectConfig(ws.AgentctlDir)
+	// Load project-local config (only project section).
+	localCfg, err := loader.LoadProjectLocalConfig(ws.AgentctlDir)
 	if err != nil {
-		return nil, fmt.Errorf("loading config: %w", err)
+		return nil, fmt.Errorf("loading project config: %w", err)
 	}
 
-	agents, err := loader.LoadAgentsConfig(ws.AgentctlDir)
-	if err != nil {
-		return nil, fmt.Errorf("loading agents: %w", err)
-	}
+	// Load project-level agents and routing (may not exist).
+	localAgents, _ := loader.LoadAgentsConfig(ws.AgentctlDir)
+	localRouting, _ := loader.LoadRoutingConfig(ws.AgentctlDir)
 
-	routing, err := loader.LoadRoutingConfig(ws.AgentctlDir)
-	if err != nil {
-		return nil, fmt.Errorf("loading routing: %w", err)
-	}
+	// Merge: global base + project overrides.
+	mergedCfg := loader.MergeConfig(globalCfg, localCfg)
+	mergedAgents := loader.MergeAgents(globalAgents, localAgents)
+	mergedRouting := loader.MergeRouting(globalRouting, localRouting)
 
 	return &LoadedWorkspace{
 		Workspace: ws,
-		Config:    cfg,
-		Agents:    agents,
-		Routing:   routing,
+		Config:    mergedCfg,
+		Agents:    mergedAgents,
+		Routing:   mergedRouting,
 	}, nil
 }
 

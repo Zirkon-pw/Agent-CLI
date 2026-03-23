@@ -10,6 +10,7 @@ import (
 	"github.com/docup/agentctl/internal/bootstrap"
 	"github.com/docup/agentctl/internal/cli"
 	cliclar "github.com/docup/agentctl/internal/cli/clarification"
+	cliconfig "github.com/docup/agentctl/internal/cli/config"
 	"github.com/docup/agentctl/internal/cli/guidelines"
 	"github.com/docup/agentctl/internal/cli/help"
 	"github.com/docup/agentctl/internal/cli/result"
@@ -36,9 +37,10 @@ func buildRootCmd() *cobra.Command {
 func newRootCmd(app *bootstrap.App, appErr error) *cobra.Command {
 	rootCmd := root.NewRootCmd()
 
-	// Init doesn't need workspace
+	// These commands don't need workspace
 	rootCmd.AddCommand(cli.NewInitCmd())
 	rootCmd.AddCommand(help.NewHelpCmd())
+	rootCmd.AddCommand(cliconfig.NewConfigCmd())
 
 	if appErr != nil {
 		configureWorkspaceUnavailable(rootCmd, appErr)
@@ -57,7 +59,7 @@ func configureWorkspaceUnavailable(rootCmd *cobra.Command, appErr error) {
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		name := cmd.Name()
 		switch name {
-		case "agentctl", "init", "help", "topics", "completion", "__complete", "__completeNoDesc":
+		case "agentctl", "init", "help", "config", "set", "get", "list", "reset", "topics", "completion", "__complete", "__completeNoDesc":
 			return nil
 		default:
 			return workspaceUnavailableError(appErr)

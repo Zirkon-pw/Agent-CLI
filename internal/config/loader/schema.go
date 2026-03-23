@@ -293,3 +293,157 @@ func DefaultRoutingConfig() *RoutingConfig {
 		},
 	}
 }
+
+// GlobalConfig contains operational settings loaded from ~/.agentcli-conf/config.yaml.
+// It holds all non-project-specific configuration that applies across projects.
+type GlobalConfig struct {
+	Execution      ExecutionConfig  `yaml:"execution"`
+	Prompting      PromptingConfig  `yaml:"prompting"`
+	Clarifications ClarificationCfg `yaml:"clarifications"`
+	Runtime        RuntimeCfg       `yaml:"runtime"`
+	Validation     ValidationCfg    `yaml:"validation"`
+	Artifacts      ArtifactsCfg     `yaml:"artifacts"`
+}
+
+// ProjectLocalConfig is the slim project-level config from .agentctl/config.yaml.
+// It contains only project-specific information.
+type ProjectLocalConfig struct {
+	Project ProjectInfo `yaml:"project"`
+}
+
+// DefaultGlobalConfig returns global config with sensible defaults.
+func DefaultGlobalConfig() *GlobalConfig {
+	return &GlobalConfig{
+		Execution: ExecutionConfig{
+			DefaultAgent: "claude",
+			Mode:         "strict",
+		},
+		Prompting: PromptingConfig{
+			BuiltinTemplates: []string{
+				"clarify_if_needed",
+				"plan_before_execution",
+				"strict_executor",
+				"research_only",
+				"review_only",
+			},
+			DefaultTemplate:        "strict_executor",
+			AllowMultipleTemplates: true,
+		},
+		Clarifications: ClarificationCfg{
+			Dir:                ".agentctl/clarifications",
+			Strategy:           "by_yml_files",
+			AllowMultipleFiles: true,
+		},
+		Runtime: RuntimeCfg{
+			MaxParallelTasks:       4,
+			HeartbeatIntervalSec:   5,
+			StaleAfterSec:          30,
+			GracefulStopTimeoutSec: 20,
+			AllowForceKill:         true,
+		},
+		Validation: ValidationCfg{
+			DefaultMode:       "simple",
+			DefaultMaxRetries: 3,
+			DefaultCommands:   []string{},
+		},
+		Artifacts: ArtifactsCfg{
+			RunsDir:    ".agentctl/runs",
+			ContextDir: ".agentctl/context",
+			ReviewsDir: ".agentctl/reviews",
+		},
+	}
+}
+
+// DefaultProjectLocalConfig returns slim project config with defaults.
+func DefaultProjectLocalConfig() *ProjectLocalConfig {
+	return &ProjectLocalConfig{
+		Project: ProjectInfo{
+			Name:     "my-project",
+			Language: "go",
+		},
+	}
+}
+
+// LoadProjectLocalConfig reads config.yaml and parses only the project section.
+func LoadProjectLocalConfig(agentctlDir string) (*ProjectLocalConfig, error) {
+	path := filepath.Join(agentctlDir, "config.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading config.yaml: %w", err)
+	}
+	var cfg ProjectLocalConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parsing config.yaml: %w", err)
+	}
+	return &cfg, nil
+}
+
+// LoadGlobalConfig reads config.yaml from the global config directory.
+func LoadGlobalConfig(globalDir string) (*GlobalConfig, error) {
+	path := filepath.Join(globalDir, "config.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading global config.yaml: %w", err)
+	}
+	var cfg GlobalConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parsing global config.yaml: %w", err)
+	}
+	return &cfg, nil
+}
+
+// MergeConfig combines global config with project-local config into a full ProjectConfig.
+func MergeConfig(global *GlobalConfig, local *ProjectLocalConfig) *ProjectConfig {
+	return &ProjectConfig{
+		Project:        local.Project,
+		Execution:      global.Execution,
+		Prompting:      global.Prompting,
+		Clarifications: global.Clarifications,
+		Runtime:        global.Runtime,
+		Validation:     global.Validation,
+		Artifacts:      global.Artifacts,
+	}
+}
+
+// MergeAgents combines global and project agents. Project agents override global by ID.
+func MergeAgents(global, local *AgentsConfig) *AgentsConfig {
+	if local == nil || len(local.Agents) == 0 {
+		return global
+	}
+
+	localByID := make(map[string]AgentDef, len(local.Agents))
+	for _, a := range local.Agents {
+		localByID[a.ID] = a
+	}
+
+	merged := make([]AgentDef, 0, len(global.Agents)+len(local.Agents))
+	seen := make(map[string]struct{})
+
+	// Global agents, overridden by local if same ID exists.
+	for _, a := range global.Agents {
+		if override, ok := localByID[a.ID]; ok {
+			merged = append(merged, override)
+		} else {
+			merged = append(merged, a)
+		}
+		seen[a.ID] = struct{}{}
+	}
+
+	// Local-only agents not in global.
+	for _, a := range local.Agents {
+		if _, ok := seen[a.ID]; !ok {
+			merged = append(merged, a)
+		}
+	}
+
+	return &AgentsConfig{Agents: merged}
+}
+
+// MergeRouting combines global and project routing.
+// If project has routing rules, they take priority over global.
+func MergeRouting(global, local *RoutingConfig) *RoutingConfig {
+	if local != nil && len(local.Routing) > 0 {
+		return local
+	}
+	return global
+}
