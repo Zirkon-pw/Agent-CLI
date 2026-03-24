@@ -85,24 +85,22 @@ validation:
 
 Текущий этап жизненного цикла задачи. На момент создания обычно `draft`.
 
-Рекомендуемый набор значений:
+Основные значения:
 
 - `draft`
 - `queued`
-- `preparing_context`
-- `running`
-- `needs_clarification`
+- `stage_running`
+- `waiting_clarification`
 - `ready_to_resume`
 - `paused`
-- `stopping`
-- `stopped`
-- `killed`
-- `validating`
-- `review`
+- `handoff_pending`
+- `reviewing`
 - `completed`
 - `failed`
 - `rejected`
 - `canceled`
+
+Legacy aliases (поддерживаются для обратной совместимости): `preparing_context`, `running`, `needs_clarification`, `pausing`, `stopping`, `stopped`, `killed`, `validating`, `review`.
 
 ### `agent`
 

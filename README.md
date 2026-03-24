@@ -49,14 +49,14 @@ make release
 # 1. Инициализация проекта
 agentctl init
 
-# 2. Создание draft-задачи
-agentctl task create
-
-# 3. Конфигурация задачи
-agentctl task update TASK-001 \
+# 2. Создание задачи
+agentctl task create \
   --title "Рефакторинг auth модуля" \
   --goal "Вынести логику авторизации в отдельный сервисный слой" \
-  --agent claude \
+  --agent claude
+
+# 3. Донастройка задачи
+agentctl task update TASK-001 \
   --add-template clarify_if_needed
 
 # 4. Запуск
@@ -78,7 +78,7 @@ agentctl task reject TASK-001 --reason "не покрыто тестами"
 
 | Команда | Описание |
 |---------|----------|
-| `task create` | Создать draft-задачу, в том числе пустую |
+| `task create` | Создать draft-задачу (обязательны `--title` и `--goal`) |
 | `task update` | Донастроить задачу в статусе draft |
 | `task run` | Запустить или продолжить session pipeline |
 | `task rerun` | Перезапустить задачу |
@@ -242,24 +242,29 @@ agents:
 
 ## Создание и настройка задач
 
-`task create` больше не требует обязательных `--title` и `--goal`. Команда может создать пустую draft-задачу, которую затем можно постепенно заполнить через `task update`.
+`task create` требует обязательные `--title` и `--goal`. Дополнительные поля можно задать сразу при создании или позже через `task update`.
 
 Примеры:
 
 ```bash
-# Пустая draft-задача
-agentctl task create
+# Создание задачи с минимальными полями
+agentctl task create \
+  --title "Подготовить auth refactor" \
+  --goal "Вынести логику авторизации в отдельный сервисный слой"
 
-# Частичное создание
-agentctl task create --title "Подготовить auth refactor"
-
-# Донастройка перед запуском
-agentctl task update TASK-001 \
+# Создание задачи с полной конфигурацией
+agentctl task create \
+  --title "Подготовить auth refactor" \
   --goal "Вынести логику авторизации в отдельный сервисный слой" \
   --agent claude \
+  --template clarify_if_needed \
+  --allowed-path internal/service/auth \
+  --must-read README.md
+
+# Донастройка через task update
+agentctl task update TASK-001 \
   --add-template clarify_if_needed \
-  --add-allowed-path internal/service/auth \
-  --add-must-read README.md
+  --add-allowed-path internal/service/auth
 
 # Расширенные правки через dot-path
 agentctl task update TASK-001 \
@@ -268,7 +273,7 @@ agentctl task update TASK-001 \
   --set runtime.max_execution_minutes=30
 ```
 
-Перед `task run` у задачи обязательно должны быть заполнены `title` и `goal`. Если `agent` или built-in шаблоны не заданы, они будут подставлены из project config во время запуска и сохранены обратно в task YAML.
+Если `agent` или built-in шаблоны не заданы, они будут подставлены из project config во время запуска и сохранены обратно в task YAML. При запуске также проверяется, что указанный агент существует в `agents.yaml`.
 
 ## Makefile
 
@@ -300,7 +305,7 @@ internal/
   bootstrap/          → DI-wiring
 ```
 
-Подробная документация — в директории `Docs/`.
+Подробная документация — в директории `docs/`.
 
 ## Лицензия
 

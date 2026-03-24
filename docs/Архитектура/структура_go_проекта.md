@@ -70,7 +70,6 @@ internal/
   infra/
     fsstore/
     executor/
-    llm/
     runtime/
     events/
     logging/
@@ -78,7 +77,7 @@ internal/
 
   config/
     loader/
-    schema/
+    global/
     builtin_templates/
 ```
 
@@ -176,7 +175,6 @@ Domain model.
 Реализация внешних зависимостей:
 
 - файловое хранилище `.agentctl/`;
-- LLM executor adapters;
 - process execution;
 - runtime registry;
 - event stream;
@@ -260,10 +258,10 @@ internal/infra/runtime/
   signals.go
   recovery.go
 
-internal/infra/llm/
-  codex_executor.go
-  claude_executor.go
-  qwen_executor.go
+internal/service/taskrunner/
+  drivers.go          # AgentRuntimeRegistry + driver resolution
+  adapter.go          # stage output parsing per agent kind
+  supervisor.go       # stage-based session supervisor
 ```
 
 Такая раскладка сохраняет простой и прямой маппинг между предметной сущностью и файловой реализацией.
