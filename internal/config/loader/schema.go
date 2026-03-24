@@ -64,9 +64,10 @@ type ArtifactsCfg struct {
 type AgentDriver string
 
 const (
-	AgentDriverClaude AgentDriver = "claude"
-	AgentDriverCodex  AgentDriver = "codex"
-	AgentDriverQwen   AgentDriver = "qwen"
+	AgentDriverClaude  AgentDriver = "claude"
+	AgentDriverCodex   AgentDriver = "codex"
+	AgentDriverQwen    AgentDriver = "qwen"
+	AgentDriverGeneric AgentDriver = "generic"
 )
 
 // AgentDef describes an available agent from agents.yaml.
@@ -271,7 +272,7 @@ func validateAgentsConfig(cfg AgentsConfig) error {
 			return fmt.Errorf("agent %q is missing command", agent.ID)
 		}
 		switch agent.Driver {
-		case AgentDriverClaude, AgentDriverCodex, AgentDriverQwen:
+		case AgentDriverClaude, AgentDriverCodex, AgentDriverQwen, AgentDriverGeneric:
 		default:
 			return fmt.Errorf("agent %q uses unsupported driver %q", agent.ID, agent.Driver)
 		}

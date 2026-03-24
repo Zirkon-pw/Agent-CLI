@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -21,7 +22,23 @@ import (
 	"github.com/docup/agentctl/internal/service/prompting"
 )
 
+func boolPtr(v bool) *bool { return &v }
+
+type testAgent struct {
+	ID     string
+	Driver loader.AgentDriver
+	Script string
+}
+
 func setupOrchestrator(t *testing.T, driver loader.AgentDriver, script string) (*Orchestrator, *fsstore.TaskStore, *fsstore.RunStore, *infrart.Registry, string) {
+	return setupOrchestratorWithAgents(t, []testAgent{{
+		ID:     "fake",
+		Driver: driver,
+		Script: script,
+	}})
+}
+
+func setupOrchestratorWithAgents(t *testing.T, agents []testAgent) (*Orchestrator, *fsstore.TaskStore, *fsstore.RunStore, *infrart.Registry, string) {
 	t.Helper()
 	root := t.TempDir()
 	agentctlDir := filepath.Join(root, ".agentctl")
@@ -29,11 +46,6 @@ func setupOrchestrator(t *testing.T, driver loader.AgentDriver, script string) (
 		if err := os.MkdirAll(filepath.Join(agentctlDir, d), 0755); err != nil {
 			t.Fatalf("mkdir %s: %v", d, err)
 		}
-	}
-
-	cliPath := filepath.Join(root, "fake-cli.sh")
-	if err := os.WriteFile(cliPath, []byte(script), 0755); err != nil {
-		t.Fatalf("write cli: %v", err)
 	}
 
 	taskStore := fsstore.NewTaskStore(agentctlDir)
@@ -49,16 +61,21 @@ func setupOrchestrator(t *testing.T, driver loader.AgentDriver, script string) (
 	cfg := loader.DefaultProjectConfig()
 	cfg.Execution.DefaultAgent = "fake"
 
-	drivers := NewAgentRuntimeRegistry(&loader.AgentsConfig{
-		Agents: []loader.AgentDef{
-			{
-				ID:      "fake",
-				Driver:  driver,
-				Command: cliPath,
-				Enabled: boolPtr(true),
-			},
-		},
-	})
+	defs := make([]loader.AgentDef, 0, len(agents))
+	for _, agent := range agents {
+		cliPath := filepath.Join(root, agent.ID+".sh")
+		if err := os.WriteFile(cliPath, []byte(agent.Script), 0755); err != nil {
+			t.Fatalf("write cli for %s: %v", agent.ID, err)
+		}
+		defs = append(defs, loader.AgentDef{
+			ID:      agent.ID,
+			Driver:  agent.Driver,
+			Command: cliPath,
+			Enabled: boolPtr(true),
+		})
+	}
+
+	drivers := NewAgentRuntimeRegistry(&loader.AgentsConfig{Agents: defs})
 
 	supervisor := NewTaskSupervisor(
 		taskStore, runStore, clarStore, registry, heartbeatMgr, eventSink,
@@ -85,6 +102,47 @@ func createDraftTask(store *fsstore.TaskStore) {
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	})
+}
+
+func initGitRepo(t *testing.T, root string) {
+	t.Helper()
+
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("/usr/bin/git", args...)
+		cmd.Dir = root
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+
+	if err := os.WriteFile(filepath.Join(root, "tracked.txt"), []byte("base\n"), 0644); err != nil {
+		t.Fatalf("write tracked file: %v", err)
+	}
+
+	run("init")
+	run("config", "user.name", "Agentctl Tests")
+	run("config", "user.email", "agentctl-tests@example.com")
+	run("add", "tracked.txt")
+	if scripts, err := filepath.Glob(filepath.Join(root, "*.sh")); err == nil {
+		for _, script := range scripts {
+			run("add", filepath.Base(script))
+		}
+	}
+	run("commit", "-m", "initial")
+}
+
+func waitForCondition(t *testing.T, timeout time.Duration, fn func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("condition not met before timeout")
 }
 
 func TestOrchestrator_Run_FullPipelineWithClaudeDriver(t *testing.T) {
@@ -381,12 +439,35 @@ func TestOrchestrator_AcceptRejectAndRoute(t *testing.T) {
 		CreatedAt: now,
 		UpdatedAt: now,
 	})
+	acceptedSession := &rt.RunSession{
+		ID:             "RUN-001",
+		TaskID:         "TASK-001",
+		Status:         rt.SessionStatusReviewing,
+		CurrentAgentID: "fake",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := runStore.SaveSession(acceptedSession); err != nil {
+		t.Fatalf("save accepted session: %v", err)
+	}
 	if err := orch.Accept("TASK-001"); err != nil {
 		t.Fatalf("accept: %v", err)
 	}
 	tk, _ := store.Load("TASK-001")
 	if tk.Status != task.StatusCompleted {
 		t.Fatalf("expected completed, got %s", tk.Status)
+	}
+	var session *rt.RunSession
+	var err error
+	session, err = runStore.LoadSession("TASK-001", "RUN-001")
+	if err != nil {
+		t.Fatalf("load accepted session: %v", err)
+	}
+	if session.Status != rt.SessionStatusCompleted {
+		t.Fatalf("expected completed session status, got %s", session.Status)
+	}
+	if session.CompletedAt == nil {
+		t.Fatal("expected completed_at to be set")
 	}
 
 	tk.Status = task.StatusReviewing
@@ -399,7 +480,7 @@ func TestOrchestrator_AcceptRejectAndRoute(t *testing.T) {
 		t.Fatalf("expected rejected, got %s", tk.Status)
 	}
 
-	session := &rt.RunSession{
+	session = &rt.RunSession{
 		ID:             "RUN-001",
 		TaskID:         "TASK-001",
 		Status:         rt.SessionStatusQueued,
@@ -415,12 +496,173 @@ func TestOrchestrator_AcceptRejectAndRoute(t *testing.T) {
 	if err := orch.Route("TASK-001", "fake", "handoff test"); err != nil {
 		t.Fatalf("route: %v", err)
 	}
-	session, err := runStore.LoadSession("TASK-001", "RUN-001")
+	session, err = runStore.LoadSession("TASK-001", "RUN-001")
 	if err != nil {
 		t.Fatalf("load session: %v", err)
 	}
 	if session.PendingHandoff == nil {
 		t.Fatal("expected pending handoff")
+	}
+}
+
+func TestOrchestrator_Run_AppliesLiveRouteBeforeNextStage(t *testing.T) {
+	orch, store, runStore, registry, _ := setupOrchestratorWithAgents(t, []testAgent{
+		{ID: "fake", Driver: loader.AgentDriverClaude, Script: routeWorkflowScript()},
+		{ID: "fake-alt", Driver: loader.AgentDriverClaude, Script: routeWorkflowScript()},
+	})
+	createDraftTask(store)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- orch.Run(context.Background(), "TASK-001")
+	}()
+
+	waitForCondition(t, 3*time.Second, func() bool {
+		active, err := registry.LoadActiveRun("TASK-001")
+		return err == nil && active != nil
+	})
+
+	if err := orch.Route("TASK-001", "fake-alt", "handoff live"); err != nil {
+		t.Fatalf("route live session: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for routed run to finish")
+	}
+
+	session, err := runStore.LatestSession("TASK-001")
+	if err != nil {
+		t.Fatalf("latest session: %v", err)
+	}
+	if session.PendingHandoff != nil {
+		t.Fatal("expected pending handoff to be consumed")
+	}
+	if len(session.StageHistory) < 3 {
+		t.Fatalf("expected handoff to add follow-up stages, got %d stages", len(session.StageHistory))
+	}
+	if session.StageHistory[1].Type != rt.StageTypeHandoff {
+		t.Fatalf("expected handoff stage, got %s", session.StageHistory[1].Type)
+	}
+
+	usedAltAgent := false
+	for _, stage := range session.StageHistory[2:] {
+		if stage.AgentID == "fake-alt" && stage.Type != rt.StageTypeHandoff {
+			usedAltAgent = true
+			break
+		}
+	}
+	if !usedAltAgent {
+		t.Fatalf("expected a post-handoff agent stage on fake-alt, got %+v", session.StageHistory)
+	}
+	if session.CurrentAgentID != "fake-alt" {
+		t.Fatalf("expected session current agent fake-alt, got %s", session.CurrentAgentID)
+	}
+
+	tk, err := store.Load("TASK-001")
+	if err != nil {
+		t.Fatalf("load task: %v", err)
+	}
+	if tk.Agent != "fake-alt" {
+		t.Fatalf("expected task agent fake-alt after handoff, got %s", tk.Agent)
+	}
+}
+
+func TestOrchestrator_Run_QwenDriverCreatesLiveSessionAndProtocolLogs(t *testing.T) {
+	orch, store, runStore, registry, _ := setupOrchestrator(t, loader.AgentDriverQwen, qwenSlowWorkflowScript())
+	createDraftTask(store)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- orch.Run(context.Background(), "TASK-001")
+	}()
+
+	waitForCondition(t, 3*time.Second, func() bool {
+		active, err := registry.LoadActiveRun("TASK-001")
+		return err == nil && active != nil
+	})
+
+	session, err := runStore.LatestSession("TASK-001")
+	if err != nil {
+		t.Fatalf("latest session while running: %v", err)
+	}
+	runDir := runStore.RunDir("TASK-001", session.ID)
+	sessionLogPath := filepath.Join(runDir, "session.log")
+	protocolLogPath := filepath.Join(runDir, "protocol.ndjson")
+	if _, err := os.Stat(sessionLogPath); err != nil {
+		t.Fatalf("expected session log during running stage: %v", err)
+	}
+	if _, err := os.Stat(protocolLogPath); err != nil {
+		t.Fatalf("expected protocol log during running stage: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for qwen run to finish")
+	}
+
+	protocolLog, err := os.ReadFile(protocolLogPath)
+	if err != nil {
+		t.Fatalf("read protocol log: %v", err)
+	}
+	if !strings.Contains(string(protocolLog), "qwen-session-1") {
+		t.Fatalf("expected qwen session id in protocol log, got %q", string(protocolLog))
+	}
+	if !strings.Contains(string(protocolLog), "AGENTCTL_RESULT_BEGIN") {
+		t.Fatalf("expected structured result markers in protocol log, got %q", string(protocolLog))
+	}
+}
+
+func TestOrchestrator_Run_CapturesDiffForUntrackedFiles(t *testing.T) {
+	orch, store, runStore, _, agentctlDir := setupOrchestrator(t, loader.AgentDriverClaude, untrackedFileWorkflowScript())
+	initGitRepo(t, filepath.Dir(agentctlDir))
+	createDraftTask(store)
+
+	if err := orch.Run(context.Background(), "TASK-001"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	session, err := runStore.LatestSession("TASK-001")
+	if err != nil {
+		t.Fatalf("latest session: %v", err)
+	}
+
+	var diffArtifact *rt.ArtifactRecord
+	for i := range session.ArtifactManifest.Items {
+		item := &session.ArtifactManifest.Items[i]
+		if item.Kind == "diff" || item.Name == "diff.patch" {
+			diffArtifact = item
+			break
+		}
+	}
+	if diffArtifact == nil {
+		t.Fatal("expected diff artifact to be recorded")
+	}
+
+	data, err := os.ReadFile(diffArtifact.Path)
+	if err != nil {
+		t.Fatalf("read diff artifact: %v", err)
+	}
+	diff := string(data)
+	if !strings.Contains(diff, "created.txt") {
+		t.Fatalf("expected diff to mention created.txt, got %q", diff)
+	}
+	if !strings.Contains(diff, "new file mode") {
+		t.Fatalf("expected untracked file patch, got %q", diff)
+	}
+	if strings.Contains(diff, ".agentctl/") {
+		t.Fatalf("did not expect runtime files in diff, got %q", diff)
+	}
+	if strings.Contains(diff, "summary.md") {
+		t.Fatalf("did not expect root-level artifact files in diff, got %q", diff)
 	}
 }
 
@@ -473,11 +715,74 @@ EOF
 `
 }
 
+func qwenSlowWorkflowScript() string {
+	return `#!/bin/sh
+/bin/sleep 1
+cat <<'EOF'
+[
+  {
+    "type":"system",
+    "session_id":"qwen-session-1"
+  },
+  {
+    "type":"assistant",
+    "session_id":"qwen-session-1",
+    "message":{
+      "content":[
+        {
+          "type":"text",
+          "text":"AGENTCTL_RESULT_BEGIN\n{\"outcome\":\"completed\",\"summary\":\"# Summary\\nDone from qwen slow\"}\nAGENTCTL_RESULT_END"
+        }
+      ]
+    }
+  },
+  {
+    "type":"result",
+    "session_id":"qwen-session-1",
+    "result":"AGENTCTL_RESULT_BEGIN\n{\"outcome\":\"completed\",\"summary\":\"# Summary\\nDone from qwen slow\"}\nAGENTCTL_RESULT_END"
+  }
+]
+EOF
+`
+}
+
 func clarificationWorkflowScript() string {
 	return `#!/bin/sh
 cat <<'EOF'
 AGENTCTL_RESULT_BEGIN
 {"outcome":"clarification_requested","reason":"Need more input","request_id":"CLAR-REQ-001","questions":[{"id":"q1","text":"What edge case should be handled?"}]}
+AGENTCTL_RESULT_END
+EOF
+`
+}
+
+func routeWorkflowScript() string {
+	return `#!/bin/sh
+if [ "$AGENTCTL_STAGE_TYPE" = "review" ]; then
+cat <<EOF
+AGENTCTL_RESULT_BEGIN
+{"outcome":"completed","summary":"reviewed by $AGENTCTL_AGENT_ID","findings":[]}
+AGENTCTL_RESULT_END
+EOF
+exit 0
+fi
+
+/bin/sleep 1
+cat <<EOF
+AGENTCTL_RESULT_BEGIN
+{"outcome":"completed","summary":"executed by $AGENTCTL_AGENT_ID"}
+AGENTCTL_RESULT_END
+EOF
+`
+}
+
+func untrackedFileWorkflowScript() string {
+	return `#!/bin/sh
+printf 'hello from new file\n' > created.txt
+printf '# Summary from agent\n' > summary.md
+cat <<'EOF'
+AGENTCTL_RESULT_BEGIN
+{"outcome":"completed","summary":"# Summary\nCreated untracked file"}
 AGENTCTL_RESULT_END
 EOF
 `

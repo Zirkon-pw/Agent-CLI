@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/docup/agentctl/internal/core/task"
 	"gopkg.in/yaml.v3"
@@ -35,6 +36,55 @@ func (s *TaskStore) Save(t *task.Task) error {
 		return fmt.Errorf("writing task %s: %w", t.ID, err)
 	}
 	return nil
+}
+
+// Create atomically allocates an ID for a new task and persists it.
+func (s *TaskStore) Create(t *task.Task) error {
+	if err := os.MkdirAll(s.baseDir, 0755); err != nil {
+		return fmt.Errorf("creating tasks dir: %w", err)
+	}
+
+	return s.withLock(func() error {
+		for {
+			autoAllocated := false
+			if t.ID == "" {
+				id, err := s.nextIDUnlocked()
+				if err != nil {
+					return err
+				}
+				t.ID = id
+				autoAllocated = true
+			}
+
+			data, err := yaml.Marshal(t)
+			if err != nil {
+				return fmt.Errorf("marshaling task %s: %w", t.ID, err)
+			}
+
+			path := filepath.Join(s.baseDir, t.ID+".yml")
+			f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+			if err != nil {
+				if os.IsExist(err) && autoAllocated {
+					t.ID = ""
+					continue
+				}
+				if os.IsExist(err) {
+					return fmt.Errorf("task %s already exists", t.ID)
+				}
+				return fmt.Errorf("writing task %s: %w", t.ID, err)
+			}
+
+			_, writeErr := f.Write(data)
+			closeErr := f.Close()
+			if writeErr != nil {
+				return fmt.Errorf("writing task %s: %w", t.ID, writeErr)
+			}
+			if closeErr != nil {
+				return fmt.Errorf("closing task %s: %w", t.ID, closeErr)
+			}
+			return nil
+		}
+	})
 }
 
 // Load reads a task from disk by ID.
@@ -90,6 +140,22 @@ func (s *TaskStore) Exists(id string) bool {
 
 // NextID generates the next task ID based on existing tasks.
 func (s *TaskStore) NextID() (string, error) {
+	var id string
+	err := s.withLock(func() error {
+		nextID, err := s.nextIDUnlocked()
+		if err != nil {
+			return err
+		}
+		id = nextID
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func (s *TaskStore) nextIDUnlocked() (string, error) {
 	entries, err := os.ReadDir(s.baseDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -111,4 +177,26 @@ func (s *TaskStore) NextID() (string, error) {
 		}
 	}
 	return fmt.Sprintf("TASK-%03d", maxNum+1), nil
+}
+
+func (s *TaskStore) withLock(fn func() error) error {
+	if err := os.MkdirAll(s.baseDir, 0755); err != nil {
+		return fmt.Errorf("creating tasks dir: %w", err)
+	}
+
+	lockPath := filepath.Join(s.baseDir, ".lock")
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return fmt.Errorf("opening task store lock: %w", err)
+	}
+	defer lockFile.Close()
+
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("locking task store: %w", err)
+	}
+	defer func() {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	}()
+
+	return fn()
 }

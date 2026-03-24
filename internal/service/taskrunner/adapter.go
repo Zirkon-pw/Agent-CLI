@@ -91,9 +91,10 @@ func NewAgentDriverRegistry(cfg *loader.AgentsConfig) *AgentDriverRegistry {
 	return &AgentDriverRegistry{
 		profiles: profiles,
 		drivers: map[loader.AgentDriver]AgentCLIDriver{
-			loader.AgentDriverClaude: newClaudeDriver(),
-			loader.AgentDriverCodex:  newCodexDriver(),
-			loader.AgentDriverQwen:   newQwenDriver(),
+			loader.AgentDriverClaude:  newClaudeDriver(),
+			loader.AgentDriverCodex:   newCodexDriver(),
+			loader.AgentDriverQwen:    newQwenDriver(),
+			loader.AgentDriverGeneric: newGenericDriver(),
 		},
 	}
 }
@@ -121,6 +122,11 @@ func (r *AgentDriverRegistry) Resolve(agentID string) (loader.AgentDef, AgentCLI
 
 // Start launches the CLI invocation as a managed process.
 func StartCLIProcess(ctx context.Context, spec *rt.StageSpec, invocation *CLIInvocation, profile loader.AgentDef) (DriverHandle, error) {
+	// Pre-validate that the command exists.
+	if _, err := exec.LookPath(invocation.Command); err != nil {
+		return nil, fmt.Errorf("agent command not found: %s (ensure it is installed and in PATH)", invocation.Command)
+	}
+
 	cmd := exec.CommandContext(ctx, invocation.Command, invocation.Args...)
 	cmd.Dir = spec.WorkDir
 	cmd.Env = append(os.Environ(), buildStageEnv(spec, profile)...)
@@ -213,6 +219,10 @@ func (h *driverHandle) wait() {
 	close(h.done)
 }
 
+// ---------------------------------------------------------------------------
+// Envelope and output parsing
+// ---------------------------------------------------------------------------
+
 type cliEnvelope struct {
 	Outcome     string                   `json:"outcome"`
 	Message     string                   `json:"message,omitempty"`
@@ -225,8 +235,19 @@ type cliEnvelope struct {
 	Findings    []rt.ReviewFinding       `json:"findings,omitempty"`
 }
 
+// ---------------------------------------------------------------------------
+// baseDriver — shared logic for all drivers
+// ---------------------------------------------------------------------------
+
 type baseDriver struct {
 	name loader.AgentDriver
+}
+
+func (d *baseDriver) Name() loader.AgentDriver              { return d.name }
+func (d *baseDriver) SupportsStage(stage rt.StageType) bool { return d.supportsStage(stage) }
+
+func (d *baseDriver) BuildStagePrompt(basePrompt string, spec *rt.StageSpec, session *rt.RunSession) (string, error) {
+	return d.buildFallbackPrompt(basePrompt, spec.Type), nil
 }
 
 func (d *baseDriver) supportsStage(stage rt.StageType) bool {
@@ -302,34 +323,23 @@ func (d *baseDriver) parsedOutputFromEnvelope(stageType rt.StageType, env *cliEn
 	return out
 }
 
+// parseStageOutputWithEnvelope is a shared implementation for drivers using standard envelope parsing.
+func (d *baseDriver) parseStageOutputWithEnvelope(spec *rt.StageSpec, capture *StageCapture) (*ParsedStageOutput, error) {
+	env, err := d.parseEnvelopeFromText(capture.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	return d.parsedOutputFromEnvelope(spec.Type, env), nil
+}
+
+// ---------------------------------------------------------------------------
+// Claude driver
+// ---------------------------------------------------------------------------
+
 type claudeDriver struct{ baseDriver }
-type codexDriver struct{ baseDriver }
-type qwenDriver struct{ baseDriver }
 
 func newClaudeDriver() AgentCLIDriver {
 	return &claudeDriver{baseDriver{name: loader.AgentDriverClaude}}
-}
-func newCodexDriver() AgentCLIDriver { return &codexDriver{baseDriver{name: loader.AgentDriverCodex}} }
-func newQwenDriver() AgentCLIDriver  { return &qwenDriver{baseDriver{name: loader.AgentDriverQwen}} }
-
-func (d *claudeDriver) Name() loader.AgentDriver { return d.name }
-func (d *codexDriver) Name() loader.AgentDriver  { return d.name }
-func (d *qwenDriver) Name() loader.AgentDriver   { return d.name }
-
-func (d *claudeDriver) SupportsStage(stage rt.StageType) bool { return d.supportsStage(stage) }
-func (d *codexDriver) SupportsStage(stage rt.StageType) bool  { return d.supportsStage(stage) }
-func (d *qwenDriver) SupportsStage(stage rt.StageType) bool   { return d.supportsStage(stage) }
-
-func (d *claudeDriver) BuildStagePrompt(basePrompt string, spec *rt.StageSpec, session *rt.RunSession) (string, error) {
-	return d.buildFallbackPrompt(basePrompt, spec.Type), nil
-}
-
-func (d *codexDriver) BuildStagePrompt(basePrompt string, spec *rt.StageSpec, session *rt.RunSession) (string, error) {
-	return d.buildFallbackPrompt(basePrompt, spec.Type), nil
-}
-
-func (d *qwenDriver) BuildStagePrompt(basePrompt string, spec *rt.StageSpec, session *rt.RunSession) (string, error) {
-	return d.buildFallbackPrompt(basePrompt, spec.Type), nil
 }
 
 func (d *claudeDriver) BuildInvocation(profile loader.AgentDef, spec *rt.StageSpec, session *rt.RunSession, prompt string) (*CLIInvocation, error) {
@@ -338,20 +348,48 @@ func (d *claudeDriver) BuildInvocation(profile loader.AgentDef, spec *rt.StageSp
 	return &CLIInvocation{Command: profile.Command, Args: args}, nil
 }
 
+func (d *claudeDriver) ParseStageOutput(spec *rt.StageSpec, capture *StageCapture) (*ParsedStageOutput, error) {
+	return d.parseStageOutputWithEnvelope(spec, capture)
+}
+
+// ---------------------------------------------------------------------------
+// Codex driver
+// ---------------------------------------------------------------------------
+
+type codexDriver struct{ baseDriver }
+
+func newCodexDriver() AgentCLIDriver {
+	return &codexDriver{baseDriver{name: loader.AgentDriverCodex}}
+}
+
 func (d *codexDriver) BuildInvocation(profile loader.AgentDef, spec *rt.StageSpec, session *rt.RunSession, prompt string) (*CLIInvocation, error) {
 	args := append([]string{}, profile.Args...)
 	args = append(args, "-q", prompt)
 	return &CLIInvocation{Command: profile.Command, Args: args}, nil
 }
 
+func (d *codexDriver) ParseStageOutput(spec *rt.StageSpec, capture *StageCapture) (*ParsedStageOutput, error) {
+	return d.parseStageOutputWithEnvelope(spec, capture)
+}
+
+// ---------------------------------------------------------------------------
+// Qwen driver
+// ---------------------------------------------------------------------------
+
+type qwenDriver struct{ baseDriver }
+
+func newQwenDriver() AgentCLIDriver {
+	return &qwenDriver{baseDriver{name: loader.AgentDriverQwen}}
+}
+
 func (d *qwenDriver) BuildInvocation(profile loader.AgentDef, spec *rt.StageSpec, session *rt.RunSession, prompt string) (*CLIInvocation, error) {
-	args := append([]string{}, profile.Args...)
+	args := normalizeQwenArgs(profile.Args)
 	if session.DriverState.ExternalSessionID != "" {
 		args = append(args, "--resume", session.DriverState.ExternalSessionID)
 	} else if len(session.StageHistory) > 0 {
 		args = append(args, "--continue")
 	}
-	args = append(args, "-p", prompt, "--output-format", "json")
+	args = append(args, "-p", prompt, "--output-format", "json", "--yolo")
 	return &CLIInvocation{
 		Command:           profile.Command,
 		Args:              args,
@@ -359,30 +397,14 @@ func (d *qwenDriver) BuildInvocation(profile loader.AgentDef, spec *rt.StageSpec
 	}, nil
 }
 
-func (d *claudeDriver) ParseStageOutput(spec *rt.StageSpec, capture *StageCapture) (*ParsedStageOutput, error) {
-	env, err := d.parseEnvelopeFromText(capture.Stdout)
-	if err != nil {
-		return nil, err
-	}
-	return d.parsedOutputFromEnvelope(spec.Type, env), nil
-}
-
-func (d *codexDriver) ParseStageOutput(spec *rt.StageSpec, capture *StageCapture) (*ParsedStageOutput, error) {
-	env, err := d.parseEnvelopeFromText(capture.Stdout)
-	if err != nil {
-		return nil, err
-	}
-	return d.parsedOutputFromEnvelope(spec.Type, env), nil
-}
-
 func (d *qwenDriver) ParseStageOutput(spec *rt.StageSpec, capture *StageCapture) (*ParsedStageOutput, error) {
-	text, sessionID, structuredLogName, structuredLog, err := parseQwenStructuredOutput(capture.Stdout)
+	text, sessionID, structuredLogName, structuredLog, meta, err := parseQwenStructuredOutput(capture.Stdout)
 	if err != nil {
 		return nil, err
 	}
 	env, err := d.parseEnvelopeFromText(text)
 	if err != nil {
-		return nil, err
+		return nil, explainQwenParseFailure(meta, err)
 	}
 	out := d.parsedOutputFromEnvelope(spec.Type, env)
 	out.ExternalSessionID = sessionID
@@ -391,39 +413,113 @@ func (d *qwenDriver) ParseStageOutput(spec *rt.StageSpec, capture *StageCapture)
 	return out, nil
 }
 
-func parseQwenStructuredOutput(stdout string) (text string, sessionID string, logName string, log []byte, err error) {
+// ---------------------------------------------------------------------------
+// Generic driver — universal driver for any CLI agent
+// ---------------------------------------------------------------------------
+
+type genericDriver struct{ baseDriver }
+
+func newGenericDriver() AgentCLIDriver {
+	return &genericDriver{baseDriver{name: loader.AgentDriverGeneric}}
+}
+
+func (d *genericDriver) BuildInvocation(profile loader.AgentDef, spec *rt.StageSpec, session *rt.RunSession, prompt string) (*CLIInvocation, error) {
+	args := append([]string{}, profile.Args...)
+	args = append(args, "-p", prompt)
+	return &CLIInvocation{Command: profile.Command, Args: args}, nil
+}
+
+func (d *genericDriver) ParseStageOutput(spec *rt.StageSpec, capture *StageCapture) (*ParsedStageOutput, error) {
+	return d.parseStageOutputWithEnvelope(spec, capture)
+}
+
+// ---------------------------------------------------------------------------
+// Qwen output parsing helpers
+// ---------------------------------------------------------------------------
+
+// qwenResultMeta captures metadata from qwen's type:"result" JSON element.
+type qwenResultMeta struct {
+	HasResult bool
+	IsError   bool
+	Subtype   string
+}
+
+func normalizeQwenArgs(args []string) []string {
+	normalized := make([]string, 0, len(args))
+	skipNext := false
+	for i := 0; i < len(args); i++ {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+
+		switch arg := args[i]; {
+		case arg == "--output-format":
+			if i+1 < len(args) {
+				skipNext = true
+			}
+			continue
+		case strings.HasPrefix(arg, "--output-format="):
+			continue
+		case arg == "--yolo":
+			continue
+		default:
+			normalized = append(normalized, args[i])
+		}
+	}
+	return normalized
+}
+
+func explainQwenParseFailure(meta qwenResultMeta, err error) error {
+	message := "qwen output is not machine-readable; ensure non-interactive runs use \"qwen -p ... --output-format json --yolo\" and that the configured CLI supports structured headless output"
+	if meta.IsError {
+		if meta.Subtype != "" {
+			return fmt.Errorf("%s (qwen result subtype: %s): %w", message, meta.Subtype, err)
+		}
+		return fmt.Errorf("%s (qwen reported an error result): %w", message, err)
+	}
+	if meta.HasResult && meta.Subtype != "" {
+		return fmt.Errorf("%s (qwen result subtype: %s): %w", message, meta.Subtype, err)
+	}
+	return fmt.Errorf("%s: %w", message, err)
+}
+
+func parseQwenStructuredOutput(stdout string) (text string, sessionID string, logName string, log []byte, meta qwenResultMeta, err error) {
 	trimmed := strings.TrimSpace(stdout)
 	if trimmed == "" {
-		return "", "", "", nil, fmt.Errorf("qwen produced empty stdout")
+		return "", "", "", nil, meta, fmt.Errorf("qwen produced empty stdout")
 	}
 
 	if strings.HasPrefix(trimmed, "[") {
-		text, sessionID, err = parseQwenJSONArray(trimmed)
+		text, sessionID, meta, err = parseQwenJSONArray(trimmed)
 		if err != nil {
-			return "", "", "", nil, err
+			return "", "", "", nil, meta, err
 		}
-		return text, sessionID, "qwen.response.json", []byte(trimmed), nil
+		return text, sessionID, "qwen.response.json", []byte(trimmed), meta, nil
 	}
 
 	if strings.HasPrefix(trimmed, "{") {
-		text, sessionID, err = parseQwenJSONLines(trimmed)
+		text, sessionID, meta, err = parseQwenJSONLines(trimmed)
 		if err == nil {
-			return text, sessionID, "qwen.response.jsonl", []byte(trimmed), nil
+			return text, sessionID, "qwen.response.jsonl", []byte(trimmed), meta, nil
 		}
 	}
 
-	return stdout, "", "", nil, nil
+	return stdout, "", "", nil, meta, nil
 }
 
-func parseQwenJSONArray(data string) (string, string, error) {
+func parseQwenJSONArray(data string) (string, string, qwenResultMeta, error) {
 	var items []map[string]any
 	if err := json.Unmarshal([]byte(data), &items); err != nil {
-		return "", "", fmt.Errorf("parsing qwen json output: %w", err)
+		return "", "", qwenResultMeta{}, fmt.Errorf("parsing qwen json output: %w", err)
+	}
+	if len(items) == 0 {
+		return "", "", qwenResultMeta{}, fmt.Errorf("qwen json output is an empty array")
 	}
 	return collectQwenText(items)
 }
 
-func parseQwenJSONLines(data string) (string, string, error) {
+func parseQwenJSONLines(data string) (string, string, qwenResultMeta, error) {
 	lines := strings.Split(data, "\n")
 	items := make([]map[string]any, 0, len(lines))
 	for _, line := range lines {
@@ -433,16 +529,20 @@ func parseQwenJSONLines(data string) (string, string, error) {
 		}
 		var item map[string]any
 		if err := json.Unmarshal([]byte(line), &item); err != nil {
-			return "", "", fmt.Errorf("parsing qwen stream-json output: %w", err)
+			return "", "", qwenResultMeta{}, fmt.Errorf("parsing qwen stream-json output: %w", err)
 		}
 		items = append(items, item)
+	}
+	if len(items) == 0 {
+		return "", "", qwenResultMeta{}, fmt.Errorf("qwen jsonl output is empty")
 	}
 	return collectQwenText(items)
 }
 
-func collectQwenText(items []map[string]any) (string, string, error) {
+func collectQwenText(items []map[string]any) (string, string, qwenResultMeta, error) {
 	var parts []string
 	sessionID := ""
+	meta := qwenResultMeta{}
 	for _, item := range items {
 		if sessionID == "" {
 			if s, _ := item["session_id"].(string); s != "" {
@@ -462,18 +562,30 @@ func collectQwenText(items []map[string]any) (string, string, error) {
 				}
 			}
 		case "result":
+			meta.HasResult = true
+			if isErr, _ := item["is_error"].(bool); isErr {
+				meta.IsError = true
+			}
+			if sub, _ := item["subtype"].(string); sub != "" {
+				meta.Subtype = sub
+			}
 			if text, _ := item["result"].(string); text != "" {
 				parts = append(parts, text)
 			}
 		}
 	}
 	if len(parts) == 0 {
-		return "", sessionID, fmt.Errorf("qwen output did not contain assistant or result text")
+		return "", sessionID, meta, fmt.Errorf("qwen output did not contain assistant or result text")
 	}
-	return strings.Join(parts, "\n"), sessionID, nil
+	return strings.Join(parts, "\n"), sessionID, meta, nil
 }
 
+// ---------------------------------------------------------------------------
+// Envelope extraction
+// ---------------------------------------------------------------------------
+
 func extractResultEnvelope(text string) ([]byte, error) {
+	// Try marker-based extraction first.
 	start := strings.Index(text, resultBeginMarker)
 	end := strings.Index(text, resultEndMarker)
 	if start >= 0 && end > start {
@@ -484,12 +596,38 @@ func extractResultEnvelope(text string) ([]byte, error) {
 		return []byte(payload), nil
 	}
 
-	trimmed := strings.TrimSpace(text)
-	if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
-		return []byte(trimmed), nil
+	// Fallback: find the last JSON object in the text.
+	lastBrace := strings.LastIndex(text, "}")
+	if lastBrace >= 0 {
+		// Search backwards for the matching opening brace.
+		depth := 0
+		for i := lastBrace; i >= 0; i-- {
+			switch text[i] {
+			case '}':
+				depth++
+			case '{':
+				depth--
+				if depth == 0 {
+					candidate := strings.TrimSpace(text[i : lastBrace+1])
+					var test map[string]any
+					if json.Unmarshal([]byte(candidate), &test) == nil {
+						return []byte(candidate), nil
+					}
+				}
+			}
+		}
 	}
-	return nil, fmt.Errorf("structured CLI result markers not found")
+
+	preview := text
+	if len(preview) > 200 {
+		preview = preview[:200] + "..."
+	}
+	return nil, fmt.Errorf("structured CLI result markers not found in output: %s", preview)
 }
+
+// ---------------------------------------------------------------------------
+// Environment helpers
+// ---------------------------------------------------------------------------
 
 func buildStageEnv(spec *rt.StageSpec, profile loader.AgentDef) []string {
 	env := []string{

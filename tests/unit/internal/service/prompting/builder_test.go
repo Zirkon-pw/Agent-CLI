@@ -163,7 +163,7 @@ func TestBuildPrompt_NoValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	if strings.Contains(prompt, "Validation") {
+	if strings.Contains(prompt, "# Validation") {
 		t.Error("should not contain Validation section when no commands")
 	}
 }

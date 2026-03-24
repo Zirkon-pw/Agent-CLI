@@ -4,6 +4,7 @@ import (
 	. "github.com/docup/agentctl/internal/app/command"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/docup/agentctl/internal/app/dto"
@@ -150,5 +151,54 @@ func TestCreateTask_IncrementingIDs(t *testing.T) {
 	}
 	if t2.ID != "TASK-002" {
 		t.Errorf("second: expected TASK-002, got %s", t2.ID)
+	}
+}
+
+func TestCreateTask_ConcurrentExecuteAssignsUniqueIDs(t *testing.T) {
+	handler, _ := setupCreateTask(t)
+
+	const total = 8
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	ids := make(chan string, total)
+	errs := make(chan error, total)
+
+	for i := 0; i < total; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			tk, err := handler.Execute(dto.CreateTaskRequest{
+				Title: "Task",
+				Goal:  "Concurrent create",
+			})
+			if err != nil {
+				errs <- err
+				return
+			}
+			ids <- tk.ID
+		}(i)
+	}
+
+	close(start)
+	wg.Wait()
+	close(ids)
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent create failed: %v", err)
+		}
+	}
+
+	seen := make(map[string]bool, total)
+	for id := range ids {
+		if seen[id] {
+			t.Fatalf("duplicate task id allocated: %s", id)
+		}
+		seen[id] = true
+	}
+	if len(seen) != total {
+		t.Fatalf("expected %d unique tasks, got %d", total, len(seen))
 	}
 }

@@ -23,14 +23,8 @@ func NewCreateTask(taskStore *fsstore.TaskStore, config *loader.ProjectConfig) *
 
 // Execute creates a new task.
 func (c *CreateTask) Execute(req dto.CreateTaskRequest) (*task.Task, error) {
-	id, err := c.taskStore.NextID()
-	if err != nil {
-		return nil, fmt.Errorf("generating task ID: %w", err)
-	}
-
 	now := time.Now()
 	t := &task.Task{
-		ID:     id,
 		Status: task.StatusDraft,
 		PromptTemplates: task.PromptTemplates{
 			Builtin: []string{},
@@ -84,7 +78,7 @@ func (c *CreateTask) Execute(req dto.CreateTaskRequest) (*task.Task, error) {
 		t.Scope.MustRead = append([]string(nil), req.Scope.MustRead...)
 	}
 
-	if err := c.taskStore.Save(t); err != nil {
+	if err := c.taskStore.Create(t); err != nil {
 		return nil, fmt.Errorf("saving task: %w", err)
 	}
 

@@ -55,16 +55,20 @@ func newConfigGetCmd() *cobra.Command {
 
 func newConfigSetCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "set <key>=<value>",
+		Use:   "set <key>=<value> | <key> <value>",
 		Short: "Set a global config value",
-		Long:  "Set a value by dot-notation path (e.g. execution.default_agent=codex).\nFor list values, use comma-separated format (e.g. prompting.builtin_templates=a,b,c).",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			parts := strings.SplitN(args[0], "=", 2)
-			if len(parts) != 2 {
-				return fmt.Errorf("expected key=value format, got %q", args[0])
+		Long:  "Set a value by dot-notation path (e.g. execution.default_agent=codex or execution.default_agent codex).\nFor list values, use comma-separated format (e.g. prompting.builtin_templates=a,b,c).",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 1 || len(args) == 2 {
+				return nil
 			}
-			key, value := parts[0], parts[1]
+			return cobra.ExactArgs(2)(cmd, args)
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			key, value, err := parseSetArgs(args)
+			if err != nil {
+				return err
+			}
 
 			if _, err := global.EnsureDir(); err != nil {
 				return err
@@ -90,10 +94,22 @@ func newConfigSetCmd() *cobra.Command {
 	}
 }
 
+func parseSetArgs(args []string) (string, string, error) {
+	if len(args) == 2 {
+		return args[0], args[1], nil
+	}
+
+	parts := strings.SplitN(args[0], "=", 2)
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("expected key=value or key value format, got %q", args[0])
+	}
+	return parts[0], parts[1], nil
+}
+
 func newConfigListCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "list",
-		Short: "Show all global configuration",
+		Use:     "list",
+		Short:   "Show all global configuration",
 		Aliases: []string{"ls"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if _, err := global.EnsureDir(); err != nil {

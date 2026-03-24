@@ -44,6 +44,7 @@ type Event struct {
 	RunID     string    `json:"run"`
 	SessionID string    `json:"session_id,omitempty"`
 	StageID   string    `json:"stage_id,omitempty"`
+	AgentID   string    `json:"agent_id,omitempty"`
 	Sequence  int64     `json:"seq,omitempty"`
 	EventType string    `json:"event"`
 	Details   string    `json:"details,omitempty"`

@@ -154,8 +154,33 @@ func (o *Orchestrator) Accept(taskID string) error {
 	if err := t.TransitionTo(task.StatusCompleted); err != nil {
 		return fmt.Errorf("cannot accept task: %w", err)
 	}
+
+	now := time.Now()
+	var session *rt.RunSession
+	if latest, err := o.runStore.LatestSession(taskID); err == nil && latest != nil {
+		session = latest
+		session.Status = rt.SessionStatusCompleted
+		session.UpdatedAt = now
+		session.CompletedAt = &now
+		if err := o.runStore.SaveSession(session); err != nil {
+			return fmt.Errorf("saving completed session: %w", err)
+		}
+	}
+
 	if err := o.taskStore.Save(t); err != nil {
 		return err
+	}
+	if session != nil {
+		o.eventSink.EmitEvent(rt.Event{
+			Timestamp: now,
+			TaskID:    taskID,
+			RunID:     session.ID,
+			SessionID: session.ID,
+			AgentID:   session.CurrentAgentID,
+			EventType: "completed",
+			Details:   "accepted",
+		})
+		return nil
 	}
 	o.eventSink.Emit(taskID, "", "completed", "accepted")
 	return nil

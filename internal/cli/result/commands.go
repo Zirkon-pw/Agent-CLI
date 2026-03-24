@@ -3,6 +3,7 @@ package result
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -80,12 +81,12 @@ func newDiffCmd(runStore *fsstore.RunStore) *cobra.Command {
 				return fmt.Errorf("no sessions found for task %s", taskID)
 			}
 
-			artifact := findArtifact(session.ArtifactManifest, []string{"diff"}, []string{"diff.patch"})
-			if artifact == nil {
+			diffPath := resolveDiffPath(runStore, taskID, session)
+			if diffPath == "" {
 				return fmt.Errorf("no diff artifact found for session %s", session.ID)
 			}
 
-			data, err := os.ReadFile(artifact.Path)
+			data, err := os.ReadFile(diffPath)
 			if err != nil {
 				return fmt.Errorf("reading diff artifact: %w", err)
 			}
@@ -94,6 +95,24 @@ func newDiffCmd(runStore *fsstore.RunStore) *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func resolveDiffPath(runStore *fsstore.RunStore, taskID string, session *rt.RunSession) string {
+	if session == nil {
+		return ""
+	}
+
+	if artifact := findArtifact(session.ArtifactManifest, []string{"diff"}, []string{"diff.patch"}); artifact != nil && artifact.Path != "" {
+		if _, err := os.Stat(artifact.Path); err == nil {
+			return artifact.Path
+		}
+	}
+
+	fallback := filepath.Join(runStore.RunDir(taskID, session.ID), "diff.patch")
+	if _, err := os.Stat(fallback); err == nil {
+		return fallback
+	}
+	return ""
 }
 
 func newListCmd(runStore *fsstore.RunStore) *cobra.Command {

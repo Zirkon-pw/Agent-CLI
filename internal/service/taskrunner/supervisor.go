@@ -78,6 +78,16 @@ func (s *TaskSupervisor) Run(ctx context.Context, t *task.Task) (*rt.RunSession,
 	}
 
 	for {
+		if _, err := s.mergePersistedControlState(t, session); err != nil {
+			return nil, err
+		}
+		if session.PendingHandoff != nil {
+			if err := s.runSyntheticHandoff(t, session); err != nil {
+				return nil, err
+			}
+			continue
+		}
+
 		lastStage := session.LastStage()
 		if (session.ReviewReport != nil || (lastStage != nil && lastStage.Type == rt.StageTypeReview && lastStage.State == rt.StageStateCompleted)) &&
 			session.Status != rt.SessionStatusReviewing {
@@ -87,13 +97,6 @@ func (s *TaskSupervisor) Run(ctx context.Context, t *task.Task) (*rt.RunSession,
 			if err := s.persistSession(t, session); err != nil {
 				return nil, err
 			}
-		}
-
-		if session.PendingHandoff != nil {
-			if err := s.runSyntheticHandoff(t, session); err != nil {
-				return nil, err
-			}
-			continue
 		}
 
 		stageType, err := s.nextStageType(t, session)
@@ -115,9 +118,12 @@ func (s *TaskSupervisor) Run(ctx context.Context, t *task.Task) (*rt.RunSession,
 			return nil, err
 		}
 
+		if _, err := s.mergePersistedControlState(t, session); err != nil {
+			return nil, err
+		}
+
 		if session.Status == rt.SessionStatusWaitingClarification ||
 			session.Status == rt.SessionStatusCanceled ||
-			session.Status == rt.SessionStatusHandoffPending ||
 			session.Status == rt.SessionStatusReviewing ||
 			session.Status == rt.SessionStatusCompleted ||
 			session.Status == rt.SessionStatusFailed {
@@ -406,6 +412,15 @@ func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, sess
 		return s.failStage(t, session, current, runtimeErrLog, err, false)
 	}
 
+	sessionLog := filepath.Join(spec.SessionDir, "session.log")
+	if err := touchFile(sessionLog); err != nil {
+		return s.failStage(t, session, current, runtimeErrLog, err, false)
+	}
+	protocolLog := filepath.Join(spec.SessionDir, "protocol.ndjson")
+	if err := touchFile(protocolLog); err != nil {
+		return s.failStage(t, session, current, runtimeErrLog, err, false)
+	}
+
 	handle, err := StartCLIProcess(ctx, spec, invocation, profile)
 	if err != nil {
 		return s.failStage(t, session, current, runtimeErrLog, err, false)
@@ -440,8 +455,31 @@ func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, sess
 	}
 	defer s.registry.UnregisterRun(t.ID, session.ID)
 
-	s.eventSink.Emit(t.ID, session.ID, "stage_started", string(spec.Type))
-	_ = s.heartbeatMgr.Write(t.ID, session.ID)
+	// Emit enriched stage_started event.
+	s.eventSink.EmitEvent(rt.Event{
+		Timestamp: time.Now(),
+		TaskID:    t.ID,
+		RunID:     session.ID,
+		SessionID: session.ID,
+		StageID:   spec.StageID,
+		AgentID:   spec.AgentID,
+		EventType: "stage_started",
+		Details:   string(spec.Type),
+	})
+	// Emit agent_started with PID.
+	s.eventSink.EmitEvent(rt.Event{
+		Timestamp: time.Now(),
+		TaskID:    t.ID,
+		RunID:     session.ID,
+		SessionID: session.ID,
+		StageID:   spec.StageID,
+		AgentID:   spec.AgentID,
+		EventType: "agent_started",
+		Details:   fmt.Sprintf("pid=%d pgid=%d cmd=%s", handle.PID(), handle.ProcessGroupID(), invocation.Command),
+	})
+	if err := s.heartbeatMgr.Write(t.ID, session.ID); err != nil {
+		_ = appendFile(runtimeErrLog, fmt.Sprintf("heartbeat write error: %v\n", err))
+	}
 
 	ticker := time.NewTicker(time.Duration(t.Runtime.HeartbeatIntervalSec) * time.Second)
 	defer ticker.Stop()
@@ -455,23 +493,34 @@ func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, sess
 		select {
 		case <-ctx.Done():
 			_ = handle.Kill()
+			// Drain channels to allow goroutines to finish.
+			s.drainChannels(stdoutCh, stderrCh)
 			return s.failStage(t, session, current, runtimeErrLog, ctx.Err(), false)
 
 		case line, ok := <-stdoutCh:
-			if ok && line != "" && stdoutLog != "" {
+			if ok && stdoutLog != "" {
 				stdoutBuf.WriteString(line)
 				stdoutBuf.WriteByte('\n')
-				_ = appendFile(stdoutLog, line+"\n")
+				if err := appendFile(stdoutLog, line+"\n"); err != nil {
+					_ = appendFile(runtimeErrLog, fmt.Sprintf("stdout log write error: %v\n", err))
+				}
+				_ = appendFile(sessionLog, fmt.Sprintf("[%s] [%s] [stdout] %s\n", time.Now().Format("15:04:05.000"), spec.StageID, line))
+				if err := appendFile(protocolLog, line+"\n"); err != nil {
+					_ = appendFile(runtimeErrLog, fmt.Sprintf("protocol log write error: %v\n", err))
+				}
 			}
 			if !ok {
 				stdoutCh = nil
 			}
 
 		case line, ok := <-stderrCh:
-			if ok && line != "" && stderrLog != "" {
+			if ok && stderrLog != "" {
 				stderrBuf.WriteString(line)
 				stderrBuf.WriteByte('\n')
-				_ = appendFile(stderrLog, line+"\n")
+				if err := appendFile(stderrLog, line+"\n"); err != nil {
+					_ = appendFile(runtimeErrLog, fmt.Sprintf("stderr log write error: %v\n", err))
+				}
+				_ = appendFile(sessionLog, fmt.Sprintf("[%s] [%s] [stderr] %s\n", time.Now().Format("15:04:05.000"), spec.StageID, line))
 			}
 			if !ok {
 				stderrCh = nil
@@ -489,9 +538,13 @@ func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, sess
 		case <-ticker.C:
 			now := time.Now()
 			session.Recovery.LastHeartbeatAt = now
-			_ = s.heartbeatMgr.Write(t.ID, session.ID)
+			if err := s.heartbeatMgr.Write(t.ID, session.ID); err != nil {
+				_ = appendFile(runtimeErrLog, fmt.Sprintf("heartbeat write error: %v\n", err))
+			}
 			active.UpdatedAt = now
-			_ = s.registry.UpdateRun(active)
+			if err := s.registry.UpdateRun(active); err != nil {
+				_ = appendFile(runtimeErrLog, fmt.Sprintf("registry update error: %v\n", err))
+			}
 		}
 	}
 
@@ -499,6 +552,10 @@ func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, sess
 	current.FinishedAt = &finished
 	session.CurrentStageID = ""
 	session.UpdatedAt = finished
+	stageDuration := ""
+	if current.StartedAt != nil {
+		stageDuration = fmt.Sprintf(" duration=%s", finished.Sub(*current.StartedAt).Round(time.Millisecond))
+	}
 
 	if terminatedBySignal(processErr, syscall.SIGTERM) || terminatedBySignal(processErr, syscall.SIGKILL) {
 		current.State = rt.StageStateCanceled
@@ -507,10 +564,29 @@ func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, sess
 		t.Status = task.StatusCanceled
 		t.UpdatedAt = finished
 		_ = s.writeStageResultArtifact(t.ID, session, spec.StageID, current.Result)
-		s.eventSink.Emit(t.ID, session.ID, "stage_completed", "canceled")
+		s.eventSink.EmitEvent(rt.Event{
+			Timestamp: finished,
+			TaskID:    t.ID,
+			RunID:     session.ID,
+			SessionID: session.ID,
+			StageID:   spec.StageID,
+			AgentID:   spec.AgentID,
+			EventType: "stage_completed",
+			Details:   "canceled" + stageDuration,
+		})
 		return s.persistSession(t, session)
 	}
 	if processErr != nil {
+		s.eventSink.EmitEvent(rt.Event{
+			Timestamp: finished,
+			TaskID:    t.ID,
+			RunID:     session.ID,
+			SessionID: session.ID,
+			StageID:   spec.StageID,
+			AgentID:   spec.AgentID,
+			EventType: "stage_failed",
+			Details:   processErr.Error() + stageDuration,
+		})
 		return s.failStage(t, session, current, runtimeErrLog, stageProcessError(processErr), false)
 	}
 
@@ -520,6 +596,16 @@ func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, sess
 		ProcessErr: processErr,
 	})
 	if err != nil {
+		s.eventSink.EmitEvent(rt.Event{
+			Timestamp: finished,
+			TaskID:    t.ID,
+			RunID:     session.ID,
+			SessionID: session.ID,
+			StageID:   spec.StageID,
+			AgentID:   spec.AgentID,
+			EventType: "stage_failed",
+			Details:   "parse error: " + err.Error() + stageDuration,
+		})
 		return s.failStage(t, session, current, runtimeErrLog, err, false)
 	}
 	if parsed.ExternalSessionID != "" {
@@ -528,12 +614,18 @@ func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, sess
 	if err := s.materializeParsedOutput(t, session, spec, parsed); err != nil {
 		return s.failStage(t, session, current, runtimeErrLog, err, false)
 	}
+	if _, err := s.mergePersistedControlState(t, session); err != nil {
+		return s.failStage(t, session, current, runtimeErrLog, err, false)
+	}
 
 	current.Result = &parsed.Result
 	switch parsed.Result.Outcome {
 	case "completed":
 		current.State = rt.StageStateCompleted
-		if spec.Type == rt.StageTypeReview {
+		if session.PendingHandoff != nil {
+			session.Status = rt.SessionStatusHandoffPending
+			t.Status = task.StatusHandoffPending
+		} else if spec.Type == rt.StageTypeReview {
 			session.Status = rt.SessionStatusReviewing
 			t.Status = task.StatusReviewing
 		} else {
@@ -564,7 +656,16 @@ func (s *TaskSupervisor) runAdapterStage(ctx context.Context, t *task.Task, sess
 	if err := s.writeStageResultArtifact(t.ID, session, spec.StageID, current.Result); err != nil {
 		return s.failStage(t, session, current, runtimeErrLog, err, false)
 	}
-	s.eventSink.Emit(t.ID, session.ID, "stage_completed", parsed.Result.Outcome)
+	s.eventSink.EmitEvent(rt.Event{
+		Timestamp: finished,
+		TaskID:    t.ID,
+		RunID:     session.ID,
+		SessionID: session.ID,
+		StageID:   spec.StageID,
+		AgentID:   spec.AgentID,
+		EventType: "stage_completed",
+		Details:   parsed.Result.Outcome + stageDuration,
+	})
 	return s.persistSession(t, session)
 }
 
@@ -577,12 +678,33 @@ func (s *TaskSupervisor) runValidation(ctx context.Context, t *task.Task, sessio
 		return nil, s.persistSession(t, session)
 	}
 
+	s.eventSink.EmitEvent(rt.Event{
+		Timestamp: time.Now(),
+		TaskID:    t.ID,
+		RunID:     session.ID,
+		SessionID: session.ID,
+		AgentID:   session.CurrentAgentID,
+		EventType: "validation_started",
+		Details:   fmt.Sprintf("commands=%d attempt=%d", len(t.Validation.Commands), session.Validation.Attempt+1),
+	})
+
 	results := make([]validation.CheckResult, 0, len(t.Validation.Commands))
 	for _, cmdStr := range t.Validation.Commands {
 		results = append(results, runValidationCommand(ctx, s.projectRoot, cmdStr))
 	}
 
-	if !allPassed(results) {
+	passed := allPassed(results)
+	s.eventSink.EmitEvent(rt.Event{
+		Timestamp: time.Now(),
+		TaskID:    t.ID,
+		RunID:     session.ID,
+		SessionID: session.ID,
+		AgentID:   session.CurrentAgentID,
+		EventType: "validation_completed",
+		Details:   fmt.Sprintf("passed=%v", passed),
+	})
+
+	if !passed {
 		session.Validation.Attempt++
 	} else {
 		session.Validation.Attempt = 0
@@ -595,7 +717,7 @@ func (s *TaskSupervisor) runValidation(ctx context.Context, t *task.Task, sessio
 		MaxRetries: t.Validation.MaxRetries,
 		CreatedAt:  time.Now(),
 		Results:    results,
-		AllPassed:  allPassed(results),
+		AllPassed:  passed,
 	}
 	data, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
@@ -676,6 +798,31 @@ func (s *TaskSupervisor) persistSession(t *task.Task, session *rt.RunSession) er
 	return s.taskStore.Save(t)
 }
 
+func (s *TaskSupervisor) mergePersistedControlState(t *task.Task, session *rt.RunSession) (bool, error) {
+	persisted, err := s.runStore.LoadSession(session.TaskID, session.ID)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	if session.PendingHandoff == nil && persisted.PendingHandoff != nil {
+		handoff := *persisted.PendingHandoff
+		session.PendingHandoff = &handoff
+		if session.Status != rt.SessionStatusCanceled &&
+			session.Status != rt.SessionStatusCompleted &&
+			session.Status != rt.SessionStatusFailed {
+			session.Status = rt.SessionStatusHandoffPending
+			t.Status = task.StatusHandoffPending
+			t.UpdatedAt = time.Now()
+		}
+		return true, nil
+	}
+
+	return false, nil
+}
+
 func (s *TaskSupervisor) ensureRuntimeErrorArtifact(taskID string, session *rt.RunSession, spec *rt.StageSpec) (string, error) {
 	path := filepath.Join(spec.StageDir, "runtime_errors.log")
 	if err := touchFile(path); err != nil {
@@ -753,6 +900,25 @@ func (s *TaskSupervisor) failStage(
 	t.Status = task.StatusFailed
 	t.UpdatedAt = now
 	return s.persistSession(t, session)
+}
+
+// drainChannels reads remaining items from stdout/stderr channels to unblock goroutines.
+func (s *TaskSupervisor) drainChannels(stdoutCh, stderrCh <-chan string) {
+	for {
+		select {
+		case _, ok := <-stdoutCh:
+			if !ok {
+				stdoutCh = nil
+			}
+		case _, ok := <-stderrCh:
+			if !ok {
+				stderrCh = nil
+			}
+		}
+		if stdoutCh == nil && stderrCh == nil {
+			return
+		}
+	}
 }
 
 func (s *TaskSupervisor) validateDriver(driver AgentCLIDriver, stageType rt.StageType) error {
@@ -1045,11 +1211,36 @@ func (s *TaskSupervisor) captureWorkspaceDiffArtifacts(taskID, sessionID string)
 		return "", "", nil
 	}
 
-	diffCmd := exec.Command("git", "-C", s.projectRoot, "diff", "--no-ext-diff", "--binary")
-	diffOut, diffErr := diffCmd.Output()
-	if diffErr != nil {
+	trackedFiles, err := gitLinesAllowEmpty(s.projectRoot, "diff", "--name-only")
+	if err != nil {
 		return "", "", nil
 	}
+	trackedFiles = filterChangedFiles(trackedFiles)
+
+	trackedDiff, err := buildTrackedDiff(s.projectRoot, trackedFiles)
+	if err != nil {
+		return "", "", nil
+	}
+
+	untrackedFiles, err := gitLinesAllowEmpty(s.projectRoot, "ls-files", "--others", "--exclude-standard")
+	if err != nil {
+		return "", "", nil
+	}
+	untrackedFiles = filterChangedFiles(untrackedFiles)
+
+	untrackedDiff, err := buildUntrackedDiff(s.projectRoot, untrackedFiles)
+	if err != nil {
+		return "", "", err
+	}
+
+	diffOut := append([]byte{}, trackedDiff...)
+	if len(untrackedDiff) > 0 {
+		if len(diffOut) > 0 && !bytes.HasSuffix(diffOut, []byte("\n")) {
+			diffOut = append(diffOut, '\n')
+		}
+		diffOut = append(diffOut, untrackedDiff...)
+	}
+
 	diffPath := ""
 	if len(diffOut) > 0 {
 		if err := s.runStore.WriteArtifact(taskID, sessionID, "diff.patch", diffOut); err != nil {
@@ -1058,16 +1249,11 @@ func (s *TaskSupervisor) captureWorkspaceDiffArtifacts(taskID, sessionID string)
 		diffPath = filepath.Join(s.runStore.RunDir(taskID, sessionID), "diff.patch")
 	}
 
-	filesCmd := exec.Command("git", "-C", s.projectRoot, "diff", "--name-only")
-	filesOut, filesErr := filesCmd.Output()
-	if filesErr != nil {
+	fileNames := mergeChangedFiles(trackedFiles, untrackedFiles)
+	if len(fileNames) == 0 {
 		return diffPath, "", nil
 	}
-	trimmed := strings.TrimSpace(string(filesOut))
-	if trimmed == "" {
-		return diffPath, "", nil
-	}
-	fileNames := strings.Split(trimmed, "\n")
+
 	data, err := json.MarshalIndent(fileNames, "", "  ")
 	if err != nil {
 		return diffPath, "", err
@@ -1076,6 +1262,129 @@ func (s *TaskSupervisor) captureWorkspaceDiffArtifacts(taskID, sessionID string)
 		return diffPath, "", err
 	}
 	return diffPath, filepath.Join(s.runStore.RunDir(taskID, sessionID), "changed_files.json"), nil
+}
+
+func gitOutputAllowChanges(root string, args ...string) ([]byte, error) {
+	cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return out, nil
+	}
+
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return out, nil
+	}
+	return nil, err
+}
+
+func gitLinesAllowEmpty(root string, args ...string) ([]string, error) {
+	out, err := gitOutputAllowChanges(root, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	trimmed := strings.TrimSpace(string(out))
+	if trimmed == "" {
+		return nil, nil
+	}
+	return strings.Split(trimmed, "\n"), nil
+}
+
+func buildTrackedDiff(root string, files []string) ([]byte, error) {
+	if len(files) == 0 {
+		return nil, nil
+	}
+
+	args := append([]string{"diff", "--no-ext-diff", "--binary", "--"}, files...)
+	return gitOutputAllowChanges(root, args...)
+}
+
+func buildUntrackedDiff(root string, files []string) ([]byte, error) {
+	if len(files) == 0 {
+		return nil, nil
+	}
+
+	var combined bytes.Buffer
+	for _, file := range files {
+		if file == "" {
+			continue
+		}
+		diff, err := gitOutputAllowChanges(root, "diff", "--no-index", "--binary", "--", "/dev/null", file)
+		if err != nil {
+			return nil, err
+		}
+		if len(diff) == 0 {
+			continue
+		}
+		if combined.Len() > 0 && !bytes.HasSuffix(combined.Bytes(), []byte("\n")) {
+			combined.WriteByte('\n')
+		}
+		combined.Write(diff)
+	}
+	return combined.Bytes(), nil
+}
+
+func filterChangedFiles(files []string) []string {
+	if len(files) == 0 {
+		return nil
+	}
+
+	filtered := make([]string, 0, len(files))
+	for _, file := range files {
+		if shouldIgnoreDiffFile(file) {
+			continue
+		}
+		filtered = append(filtered, file)
+	}
+	return filtered
+}
+
+func shouldIgnoreDiffFile(path string) bool {
+	clean := filepath.Clean(path)
+	if clean == "." || clean == "" {
+		return true
+	}
+	if clean == ".agentctl" || strings.HasPrefix(clean, ".agentctl"+string(filepath.Separator)) {
+		return true
+	}
+	if !strings.Contains(clean, string(filepath.Separator)) {
+		switch clean {
+		case "summary.md", "diff.patch", "changed_files.json", "review_report.json", "validation.json", "handoff.json":
+			return true
+		}
+	}
+	return false
+}
+
+func mergeChangedFiles(trackedFiles, untrackedFiles []string) []string {
+	if len(trackedFiles) == 0 && len(untrackedFiles) == 0 {
+		return nil
+	}
+
+	merged := make([]string, 0, len(trackedFiles)+len(untrackedFiles))
+	seen := make(map[string]struct{}, len(trackedFiles)+len(untrackedFiles))
+	for _, file := range trackedFiles {
+		if file == "" {
+			continue
+		}
+		if _, ok := seen[file]; ok {
+			continue
+		}
+		seen[file] = struct{}{}
+		merged = append(merged, file)
+	}
+	for _, file := range untrackedFiles {
+		if file == "" {
+			continue
+		}
+		if _, ok := seen[file]; ok {
+			continue
+		}
+		seen[file] = struct{}{}
+		merged = append(merged, file)
+	}
+	return merged
 }
 
 func (s *TaskSupervisor) writeStageResultArtifact(taskID string, session *rt.RunSession, stageID string, result *rt.StageResult) error {

@@ -26,6 +26,7 @@ func NewWatchCmd(inspectQuery *query.InspectTask, rtMgr *runtimecontrol.Manager)
 
 			sigCh := make(chan os.Signal, 1)
 			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+			defer signal.Stop(sigCh)
 
 			fmt.Printf("Watching task %s (Ctrl+C to stop)\n\n", taskID)
 
@@ -50,6 +51,16 @@ func NewWatchCmd(inspectQuery *query.InspectTask, rtMgr *runtimecontrol.Manager)
 				fmt.Printf("Title: %s\n", detail.Title)
 				fmt.Printf("Updated: %s\n\n", detail.UpdatedAt.Format("15:04:05"))
 
+				// Session info
+				if detail.LatestSession != nil {
+					sess := detail.LatestSession
+					fmt.Printf("Session: %s | Status: %s | Agent: %s\n", sess.ID, sess.Status, sess.Agent)
+					if sess.LastStageID != "" {
+						fmt.Printf("Last stage: %s (%s) — %s\n", sess.LastStageID, sess.LastStageType, sess.LastOutcome)
+					}
+					fmt.Println()
+				}
+
 				// Runtime
 				if rtMgr != nil {
 					info, err := rtMgr.Inspect(taskID)
@@ -60,7 +71,14 @@ func NewWatchCmd(inspectQuery *query.InspectTask, rtMgr *runtimecontrol.Manager)
 						}
 						fmt.Println("\nRecent events:")
 						for _, ev := range info.Events {
-							fmt.Printf("  [%s] %s\n", ev.Timestamp.Format("15:04:05"), ev.EventType)
+							line := fmt.Sprintf("  [%s] %s", ev.Timestamp.Format("15:04:05"), ev.EventType)
+							if ev.StageID != "" {
+								line += fmt.Sprintf(" [%s]", ev.StageID)
+							}
+							if ev.Details != "" {
+								line += " — " + ev.Details
+							}
+							fmt.Println(line)
 						}
 					}
 				}

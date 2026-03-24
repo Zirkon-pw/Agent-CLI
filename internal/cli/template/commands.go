@@ -37,10 +37,8 @@ func newListCmd(templateStore *fsstore.TemplateStore) *cobra.Command {
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 			fmt.Fprintln(w, "ID\tNAME\tTYPE\tDESCRIPTION")
 
-			if builtin {
-				for _, t := range builtin_templates.All() {
-					fmt.Fprintf(w, "%s\t%s\tbuiltin\t%s\n", t.ID, t.Name, truncateDesc(t.Description, 60))
-				}
+			for _, t := range builtin_templates.All() {
+				fmt.Fprintf(w, "%s\t%s\tbuiltin\t%s\n", t.ID, t.Name, truncateDesc(t.Description, 60))
 			}
 
 			custom, err := templateStore.List()
@@ -55,7 +53,7 @@ func newListCmd(templateStore *fsstore.TemplateStore) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().BoolVar(&builtin, "builtin", false, "Show built-in templates")
+	cmd.Flags().BoolVar(&builtin, "builtin", false, "Deprecated alias; built-in templates are always shown")
 	return cmd
 }
 

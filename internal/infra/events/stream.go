@@ -22,19 +22,26 @@ func NewSink(baseDir string) *Sink {
 
 // Emit writes an event to the events.ndjson file for a task.
 func (s *Sink) Emit(taskID, runID, eventType, details string) error {
-	event := runtime.Event{
+	return s.EmitEvent(runtime.Event{
 		Timestamp: time.Now(),
 		TaskID:    taskID,
 		RunID:     runID,
 		EventType: eventType,
 		Details:   details,
+	})
+}
+
+// EmitEvent writes a fully populated event to the events.ndjson file.
+func (s *Sink) EmitEvent(event runtime.Event) error {
+	if event.Timestamp.IsZero() {
+		event.Timestamp = time.Now()
 	}
 	data, err := json.Marshal(event)
 	if err != nil {
 		return err
 	}
 
-	dir := filepath.Join(s.baseDir, taskID)
+	dir := filepath.Join(s.baseDir, event.TaskID)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}

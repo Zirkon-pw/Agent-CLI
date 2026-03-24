@@ -54,6 +54,32 @@ func TestTemplateListCmd_Builtin(t *testing.T) {
 	}
 }
 
+func TestTemplateListCmd_DefaultShowsBuiltinAndCustom(t *testing.T) {
+	store := setupTemplateStore(t)
+	if err := store.Save(&coretemplate.PromptTemplate{
+		ID:          "custom-template",
+		Name:        "Custom Template",
+		Description: "Custom template description",
+	}); err != nil {
+		t.Fatalf("save template: %v", err)
+	}
+
+	cmd := NewTemplateCmd(store)
+	cmd.SetArgs([]string{"list"})
+	output := testio.CaptureStdout(t, func() {
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+	})
+
+	if !strings.Contains(output, "clarify_if_needed") {
+		t.Fatalf("expected builtin template in output, got %q", output)
+	}
+	if !strings.Contains(output, "custom-template") {
+		t.Fatalf("expected custom template in output, got %q", output)
+	}
+}
+
 func TestTemplateListCmd_TruncatesDescription(t *testing.T) {
 	store := setupTemplateStore(t)
 	longDesc := "this is a very long description that definitely exceeds the maximum character limit we set"
